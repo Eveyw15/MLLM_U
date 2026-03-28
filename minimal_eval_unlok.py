@@ -99,6 +99,13 @@ def run_with_image(model, processor, question: str, image: Image.Image,
     return processor.decode(output[0], skip_special_tokens=True)
 
 
+def load_processor(model_id: str):
+    try:
+        return LlavaProcessor.from_pretrained(model_id, backend="pil")
+    except TypeError:
+        return LlavaProcessor.from_pretrained(model_id, use_fast=False)
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -129,7 +136,7 @@ def main():
     quant_config = None if args.no_quantize else BitsAndBytesConfig(load_in_8bit=True)
 
     print(f"Loading processor: {args.model_id}")
-    processor = LlavaProcessor.from_pretrained(args.model_id, use_fast=False)
+    processor = load_processor(args.model_id)
 
     print("Loading model...")
     model = LlavaForConditionalGeneration.from_pretrained(

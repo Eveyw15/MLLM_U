@@ -96,13 +96,44 @@ class HiddenStateCapture:
         self.state = None
 
 
+def get_language_layers(model):
+    """
+    Resolve the decoder block list across Hugging Face Llava variants.
+
+    Older transformers versions expose:
+        model.language_model.model.layers
+    Newer versions expose:
+        model.model.language_model.layers
+    """
+    language_model = getattr(model, "language_model", None)
+    if language_model is None and hasattr(model, "model"):
+        language_model = getattr(model.model, "language_model", None)
+
+    if language_model is None:
+        raise AttributeError(
+            f"Could not find language_model on {type(model).__name__}."
+        )
+
+    if hasattr(language_model, "layers"):
+        return language_model.layers
+
+    if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
+        return language_model.model.layers
+
+    raise AttributeError(
+        "Could not locate transformer layers. Expected one of "
+        "`language_model.layers` or `language_model.model.layers`."
+    )
+
+
 def register_hooks(model, layer_indices: list[int]) -> tuple[dict[int, HiddenStateCapture], list]:
     """Register hooks on the specified language model layers. Returns captures and handle list."""
     captures = {}
     handles = []
+    layers = get_language_layers(model)
     for idx in layer_indices:
         cap = HiddenStateCapture()
-        layer = model.language_model.model.layers[idx]
+        layer = layers[idx]
         handle = layer.register_forward_hook(cap.hook)
         captures[idx] = cap
         handles.append(handle)
@@ -213,6 +244,13 @@ def parse_args():
     return p.parse_args()
 
 
+def load_processor(model_id: str):
+    try:
+        return LlavaProcessor.from_pretrained(model_id, backend="pil")
+    except TypeError:
+        return LlavaProcessor.from_pretrained(model_id, use_fast=False)
+
+
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -236,7 +274,7 @@ def main():
     # Load model
     quant_config = None if args.no_quantize else BitsAndBytesConfig(load_in_8bit=True)
     print(f"Loading processor: {args.model_id}")
-    processor = LlavaProcessor.from_pretrained(args.model_id, use_fast=False)
+    processor = load_processor(args.model_id)
     print("Loading model...")
     model = LlavaForConditionalGeneration.from_pretrained(
         args.model_id,
@@ -247,7 +285,8 @@ def main():
     )
     model.eval()
 
-    n_layers = len(model.language_model.model.layers)
+    layers = get_language_layers(model)
+    n_layers = len(layers)
     print(f"LM has {n_layers} layers. Analyzing: {args.layers}")
     for idx in args.layers:
         assert 0 <= idx < n_layers, f"Layer {idx} out of range [0, {n_layers-1}]"
