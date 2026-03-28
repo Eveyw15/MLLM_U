@@ -88,8 +88,23 @@ class HiddenStateCapture:
         self.state: torch.Tensor | None = None
 
     def hook(self, module, input, output):
-        # LLaMA layer output is a tuple; first element is the hidden state
-        h = output[0]              # shape: [batch, seq_len, hidden_dim]
+        if isinstance(output, (tuple, list)):
+            h = output[0]
+        else:
+            h = output
+
+        if not isinstance(h, torch.Tensor):
+            raise TypeError(
+                f"Unexpected layer output type: {type(output).__name__}"
+            )
+
+        if h.dim() == 2:
+            h = h.unsqueeze(0)
+        elif h.dim() != 3:
+            raise ValueError(
+                f"Expected hidden state with 2 or 3 dims, got shape {tuple(h.shape)}"
+            )
+
         self.state = h.detach().cpu().float()
 
     def clear(self):
@@ -200,8 +215,19 @@ def compute_channel_sensitivity(
                 if idx not in h_dummy or idx not in h_true:
                     continue
 
-                hd = h_dummy[idx]  # [1, seq_len, hidden_dim]
+                hd = h_dummy[idx]
                 ht = h_true[idx]
+
+                if hd.dim() == 2:
+                    hd = hd.unsqueeze(0)
+                if ht.dim() == 2:
+                    ht = ht.unsqueeze(0)
+                if hd.dim() != 3 or ht.dim() != 3:
+                    print(
+                        f"  Skipping id={rec['id']} layer={idx}: "
+                        f"unexpected shapes dummy={tuple(hd.shape)} true={tuple(ht.shape)}"
+                    )
+                    continue
 
                 # Align sequence lengths (should be identical, but guard just in case)
                 min_seq = min(hd.shape[1], ht.shape[1])
