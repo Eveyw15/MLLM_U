@@ -1,0 +1,12 @@
+# Install this file on Colab for GPU inference with 8-bit quantization.
+# Run: pip install -r requirements-colab.txt
+#
+# Base deps are included here so a single install command covers everything.
+torch>=2.0.0
+transformers>=4.37.0
+Pillow>=9.0.0
+tqdm>=4.65.0
+pandas>=2.0.0
+numpy>=1.24.0
+accelerate>=0.26.0
+bitsandbytes>=0.46.1
