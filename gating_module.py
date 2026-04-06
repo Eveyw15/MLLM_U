@@ -108,10 +108,10 @@ class InputConditionedGate(nn.Module):
         Returns:
             gate: [B, k] values in [0, 1]
         """
-        x = self.pool_fn(h_k)       # [B, k]
+        x = self.pool_fn(h_k).to(self.fc1.weight.dtype)  # [B, k]
         x = F.relu(self.fc1(x))     # [B, k]
         x = self.fc2(x)             # [B, k]
-        return torch.sigmoid(x)     # [B, k]
+        return torch.sigmoid(x).to(h_k.dtype)  # [B, k]
 
     @torch.no_grad()
     def get_gate_values(self, h_k: torch.Tensor) -> torch.Tensor:
