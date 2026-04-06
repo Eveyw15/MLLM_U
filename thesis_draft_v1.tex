@@ -1,0 +1,1037 @@
+%% ============================================================
+%%  Honours Thesis — First Draft
+%%  Topic: Cross-Modal Residual Leakage in Multimodal Privacy
+%%         Unlearning: Measurement and Inference-Time Suppression
+%%
+%%  Status: First complete draft — all results are preliminary.
+%%          Claims are bounded by current evidence.
+%% ============================================================
+
+\documentclass[12pt, a4paper]{article}
+
+% ── packages ─────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{setspace}
+\onehalfspacing
+\usepackage{microtype}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue]{hyperref}
+\usepackage{natbib}
+\bibliographystyle{plainnat}
+\usepackage{parskip}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{enumitem}
+
+% ── custom commands ───────────────────────────────────────────
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+\newcommand{\placeholder}[1]{\textcolor{gray}{\textit{[#1]}}}
+\newcommand{\leakgap}{\ensuremath{\Delta_{\text{leak}}}}
+
+% ── metadata ─────────────────────────────────────────────────
+\title{%
+  \textbf{Cross-Modal Residual Leakage in Multimodal\\
+  Privacy Unlearning: Measurement and\\
+  Inference-Time Suppression}\\[6pt]
+  \large Honours Thesis --- First Draft
+}
+\author{
+  \placeholder{Student Name}\\
+  \placeholder{University of Sydney}\\
+  \placeholder{School of Computer Science}\\[4pt]
+  \small Supervised by \placeholder{Supervisor Name}
+}
+\date{\today}
+
+% ── document ─────────────────────────────────────────────────
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}
+Machine unlearning has emerged as a practical tool for removing private or sensitive
+knowledge from large language models (LLMs) after training.
+However, current unlearning methods are predominantly evaluated on text-only behaviour,
+leaving open a significant vulnerability: even when knowledge appears to be removed from
+a model's text-side responses, it may remain accessible through image-conditioned
+inputs in multimodal large language models (MLLMs).
+This thesis investigates what we term \emph{cross-modal residual leakage} --- the
+phenomenon whereby private factual knowledge survives text-side unlearning and can be
+partially recovered when a relevant image is provided at inference time.
+
+Using LLaVA-1.5-7B as the experimental platform and a subset of the UnLOK-VQA
+benchmark~\citep{unlok2025}, we first establish a concrete, measurable leakage signal:
+providing a semantically relevant image (as opposed to a blank dummy image) raises the
+model's correct-answer rate from 0.260 to 0.540 on 50 evaluation samples, yielding a
+leakage gap of $+0.280$.
+We then identify internal hidden-state channels whose activation patterns are most
+sensitive to the presence of a real image on \emph{leak-like} cases---samples where the
+image, but not the dummy, enables a correct response.
+Finally, we implement and evaluate a lightweight inference-time suppression method that
+zeros out the most sensitive channels using a forward hook, requiring no retraining of
+any model parameters.
+
+Preliminary results on the leak-like subset show that suppressing the top-5 channels in
+layer~31 reduces the recovery rate on that subset from $1.000$ to $0.632$, with
+seven positive flips and no negative flips within the leak-like set.
+However, no stable improvement is observed on the full 50-sample evaluation set,
+indicating that the method has targeted suppression potential but does not yet achieve
+broad, reliable leakage reduction.
+These results are reported honestly as mixed preliminary evidence.
+Limitations, open questions, and planned next steps are discussed.
+\end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
+
+% ──────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:introduction}
+% ──────────────────────────────────────────────────────────────
+
+The widespread deployment of large language models (LLMs) in real-world applications
+has raised growing concerns about the privacy of information encoded during training.
+Models trained on large web-scale corpora may inadvertently memorise personal facts,
+confidential information, or copyrighted material, and such knowledge can be elicited
+through targeted prompting even without the model's ``awareness'' that it is doing so.
+Machine unlearning offers a principled response to this concern: rather than
+retraining a model from scratch, unlearning methods modify or constrain a trained model
+to suppress knowledge associated with a designated \emph{forget set}, ideally without
+degrading performance on unrelated tasks~\citep{llmunlearning2024}.
+
+Despite notable progress, the unlearning literature has raised an important warning: what
+appears to be successful forgetting at the surface level may in fact be obfuscation or
+suppression that leaves the underlying knowledge partially intact.
+\citet{relearning2024} demonstrate that models which pass standard forgetting evaluations
+can have their ``forgotten'' knowledge jogged back to the surface through relatively
+mild relearning procedures, suggesting that current evaluation protocols may be
+insufficient to certify genuine removal.
+This brittle quality is not a mere theoretical concern---it motivates asking whether
+seemingly unrelated probing pathways, including alternative input modalities, can
+also recover suppressed knowledge.
+
+Multimodal large language models (MLLMs), which process both text and images within a
+shared representational framework, present a particularly acute version of this
+problem.
+When an MLLM is subjected to text-side unlearning, the language components of the model
+may be modified to reduce textual recall of certain facts.
+However, the visual processing pathway and the cross-modal interaction layers are
+typically left untouched.
+This creates a potential \emph{backpath}: a semantically relevant image provided at
+inference time may reactivate knowledge via visual-to-language projections in layers
+that were not targeted during unlearning.
+The coupling between modalities, as exemplified by large-scale cross-modal alignment
+systems~\citep{imagebind2023}, means that effective unlearning in the multimodal setting
+demands more than removing information from one modality in isolation.
+
+Recent work has begun to address this gap.
+\citet{multidelete2023} introduce the multimodal machine unlearning problem and propose
+early methods for forgetting information that spans both vision and language.
+\citet{singleimage2024} focus on the efficient unlearning of visual concepts from MLLMs.
+\citet{mmunlearner2025} reformulate the problem specifically for instruction-following
+MLLMs, noting the need to distinguish between forgetting visual representations and
+preserving unrelated textual capabilities.
+Nonetheless, the precise mechanism by which visual inputs can bypass text-side
+unlearning---and how such leakage might be detected and mitigated---remains an
+underexplored question.
+
+This thesis makes the following contributions:
+
+\begin{enumerate}[label=(\arabic*), leftmargin=*, itemsep=2pt]
+  \item We define and operationalise \emph{cross-modal residual leakage} as a measurable
+    quantity: the increase in a model's correct-response rate when a semantically
+    relevant image is substituted for a blank dummy image, evaluated on samples where
+    text-side unlearning has nominally removed the target knowledge.
+
+  \item We implement an automated pipeline that identifies \emph{leak-like cases}
+    (instances where the image, but not the dummy, enables a correct response) and uses
+    hidden-state forward hooks to compute \emph{channel sensitivity scores}---a
+    per-channel measure of how strongly each internal dimension responds differently to
+    real versus dummy images on those leak-like cases.
+
+  \item We implement a lightweight \emph{inference-time channel suppression} method that
+    scales selected high-sensitivity channels to zero using a registered forward hook on
+    one transformer layer, requiring no modification of model weights.
+
+  \item We evaluate this method on a 50-sample subset of the UnLOK-VQA
+    benchmark~\citep{unlok2025} and report honest preliminary results: the method shows
+    a targeted suppression effect on the leak-like subset but does not yet produce
+    stable improvement on the full evaluation set.
+\end{enumerate}
+
+We are careful throughout to distinguish between what has been implemented, what is
+supported by current preliminary evidence, and what remains as future work.
+The aim of this thesis is not to claim a fully validated solution but to establish a
+grounded framework for thinking about cross-modal leakage and to provide initial evidence
+that internal channel analysis is a meaningful approach to studying it.
+
+
+% ──────────────────────────────────────────────────────────────
+\section{Related Work}
+\label{sec:related}
+% ──────────────────────────────────────────────────────────────
+
+\subsection{Machine Unlearning in Language Models}
+
+Machine unlearning refers to the problem of modifying a trained model so that it no
+longer encodes or expresses knowledge associated with a specified forget
+set~\citep{llmunlearning2024}.
+In the LLM setting, motivating use cases include the removal of personally identifying
+information, the suppression of harmful or copyrighted content, and compliance with
+data-deletion regulations.
+\citet{llmunlearning2024} provide a comprehensive treatment of the unlearning problem
+for LLMs, framing it as a post-training alignment step and evaluating multiple forgetting
+strategies on practical tasks.
+
+A key challenge in evaluating unlearning quality is distinguishing genuine removal from
+superficial suppression.
+\citet{tofu2024} introduce the TOFU benchmark, which evaluates unlearning using
+counterfactual and probing questions designed to reveal whether the model has
+truly forgotten target information or has merely learned to avoid expressing it in
+standard forms.
+Their results highlight that simple fine-tuning or gradient ascent approaches can produce
+models that appear to forget at the surface while retaining the underlying knowledge.
+This observation is reinforced by \citet{relearning2024}, who demonstrate that apparently
+unlearned models can be induced to recall their forgotten knowledge through brief benign
+relearning procedures.
+Together, these findings motivate a more adversarial and probe-oriented view of
+unlearning evaluation---one that includes cross-modal probing as an additional axis of
+vulnerability.
+
+\subsection{Multimodal and MLLM Unlearning}
+
+The multimodal unlearning problem introduces structural complications beyond those of
+text-only settings.
+\citet{multidelete2023} are among the first to formalise the problem, noting that
+knowledge in multimodal systems exists as associations spanning both visual and
+linguistic modalities, and that forgetting must therefore operate across modalities
+jointly.
+A method that removes textual recall of a fact may leave visual retrieval pathways
+largely intact, and vice versa.
+
+More recent work has targeted the instruction-following MLLM specifically.
+\citet{singleimage2024} propose an efficient fine-tuning approach for forgetting
+visual concepts, using gradient-based updates applied at the level of image-conditioned
+generation.
+\citet{mmunlearner2025} reformulate the problem in the context of modern instruction-tuned
+MLLMs, distinguishing between the goals of forgetting visual patterns and preserving
+general textual capabilities.
+Their framing is conceptually aligned with the present thesis: both treat
+the inter-modal coupling of vision-language models as a primary source of difficulty for
+selective forgetting.
+
+In the domain of representation-level vision-language alignment, \citet{cliperase2024}
+examine the unlearning of visual-textual associations in CLIP-style models.
+Although CLIP is architecturally distinct from an autoregressive MLLM, their finding
+that association-level suppression can be achieved without wholesale model modification
+provides a useful precedent for approaches that target specific representational
+components rather than retraining the full model.
+
+\citet{unlok2025} introduce the UnLOK-VQA benchmark specifically for evaluating
+multimodal unlearning in MLLMs.
+The benchmark provides knowledge-grounded visual question-answering instances,
+each associated with an image identifier and a target answer, and supports evaluation
+under attack-defense framing.
+The experiments in this thesis use a 50-sample subset of the UnLOK-VQA evaluation data
+as the primary evaluation setting.
+
+\subsection{Multimodal Representation Spaces}
+
+A key background intuition for cross-modal leakage is the extent to which vision and
+language information becomes entangled within a shared representational space.
+\citet{imagebind2023} demonstrate that modern large-scale models can learn a single
+embedding space that binds representations from images, text, audio, and other
+modalities, such that knowledge associated with one modality is often accessible via
+another.
+While LLaVA-1.5 is not an ImageBind-style model, the same principle applies at the
+level of cross-modal projection layers: the visual token representations produced by
+the vision encoder are mapped into the language model's embedding space, and
+information flows between these representations during generation.
+The CLIP encoder underlying LLaVA's vision component~\citep{clip2021} further
+establishes tight semantic alignment between visual and textual representations,
+which plausibly facilitates the recovery of textual knowledge through visual prompting.
+
+\subsection{Representation-Level Information Removal}
+
+The present method is conceptually related to, though distinct from, approaches that
+suppress unwanted information at the representational level.
+\citet{nullspace2020} propose iterative nullspace projection as a way to remove the
+influence of protected attributes from text representations, demonstrating that
+targeted channel-level manipulation can reduce information leakage without destroying
+overall representation quality.
+The method in this thesis applies a simpler form of suppression---scaling selected
+hidden-state channels by a scalar factor using an inference-time hook---and differs
+in motivation (cross-modal leakage rather than demographic attribute removal) and scope
+(no iterative retraining is involved).
+
+
+% ──────────────────────────────────────────────────────────────
+\section{Problem Definition and Threat Model}
+\label{sec:problem}
+% ──────────────────────────────────────────────────────────────
+
+\subsection{Setting}
+
+We consider a multimodal large language model $\mathcal{M}$ that has been subjected to
+text-side unlearning with respect to a forget set
+$\mathcal{F} = \{(q_i, a_i)\}_{i=1}^{N}$ of factual question-answer pairs.
+The unlearning procedure is assumed to have reduced the model's tendency to produce the
+target answer $a_i$ in response to the question $q_i$ when presented in a
+text-only or dummy-image context.
+Concretely, we follow the evaluation framing of \citet{unlok2025} and do not apply
+a separate unlearning procedure ourselves; instead, we use the benchmark's data to
+construct an \emph{apparent forgetting} scenario and measure the extent to which
+image input enables recovery.
+
+\subsection{Cross-Modal Residual Leakage}
+
+\begin{definition}[Cross-Modal Residual Leakage]
+\label{def:leakage}
+Let $\mathcal{M}$ be an MLLM evaluated on a set of factual VQA instances
+$\{(q_i, a_i, v_i)\}_{i=1}^{N}$, where $q_i$ is a question, $a_i$ is the target
+answer, and $v_i$ is a semantically relevant image.
+Let $v_{\emptyset}$ denote a semantically uninformative dummy image (e.g., a blank
+white frame).
+Define:
+\[
+  r_{\text{dummy}} = \frac{1}{N} \sum_{i=1}^{N} \mathbf{1}\bigl[\hat{a}_i^{\emptyset}
+  \approx a_i\bigr], \qquad
+  r_{\text{true}} = \frac{1}{N} \sum_{i=1}^{N} \mathbf{1}\bigl[\hat{a}_i^{v_i}
+  \approx a_i\bigr],
+\]
+where $\hat{a}_i^{v}$ denotes the model's generated answer when image $v$ is provided.
+The \emph{leakage gap} is defined as
+\[
+  \leakgap = r_{\text{true}} - r_{\text{dummy}}.
+\]
+A positive $\leakgap$ constitutes evidence of cross-modal residual leakage: the
+semantically relevant image enables the model to produce correct responses on cases
+where the uninformative baseline fails.
+\end{definition}
+
+This definition is designed to be conservative and measurable.
+It does not require access to the internals of the unlearning procedure and does not
+assume that the model was definitively forced to forget the target knowledge.
+Rather, it measures the \emph{marginal information contributed by the visual modality}
+as a differential rate.
+
+\subsection{Leak-Like Cases}
+
+A critical subset of instances for our analysis is the \emph{leak-like set}:
+\[
+  \mathcal{L} = \bigl\{ i : \text{image found} \land
+  \mathbf{1}[\hat{a}_i^{v_i} \approx a_i] = 1 \land
+  \mathbf{1}[\hat{a}_i^{\emptyset} \approx a_i] = 0 \bigr\}.
+\]
+These are instances where providing the true image, but not the dummy image, enables a
+correct answer.
+They represent the most direct observable signal of cross-modal leakage.
+Note that $|\mathcal{L}|$ is generally much smaller than $N$; in our experiments,
+$|\mathcal{L}| = 18$ out of 50 total samples.
+
+\subsection{Threat Model}
+
+We adopt a passive, query-time threat model.
+The adversary is assumed to:
+
+\begin{itemize}[itemsep=2pt]
+  \item Have black-box query access to an unlearned MLLM.
+  \item Be able to supply images alongside text queries at inference time.
+  \item Use semantically relevant images (e.g., images of a person or location
+    associated with the forgotten fact) rather than adversarially crafted perturbations.
+  \item Evaluate model responses using a soft-match criterion (see
+    Section~\ref{sec:setup:eval}) to determine whether the target answer was recovered.
+\end{itemize}
+
+This threat model is deliberately mild: the adversary does not perform gradient-based
+optimisation, does not have access to model weights, and does not use adversarial images.
+We focus on the simplest, most natural form of cross-modal probing because even this
+mild setting already reveals a meaningful leakage gap in preliminary experiments.
+Stronger adversarial settings---such as adversarial visual prompts or multi-turn
+elicitation---are left for future work.
+
+\subsection{Goal of Suppression}
+
+Given the threat model above, the goal of inference-time suppression is to reduce
+$\leakgap$ while preserving $r_{\text{dummy}}$ as a proxy for general utility.
+Concretely, a successful suppression method should:
+\begin{itemize}[itemsep=2pt]
+  \item Decrease $r_{\text{true}}^{\text{suppressed}}$ relative to $r_{\text{true}}$,
+    ideally approaching $r_{\text{dummy}}$.
+  \item Not substantially decrease $r_{\text{dummy}}$, since this would imply
+    degradation on non-leaked knowledge.
+  \item Show this effect specifically and preferentially on $\mathcal{L}$ rather than
+    degrading general outputs indiscriminately.
+\end{itemize}
+Whether the current method achieves these goals is discussed in
+Section~\ref{sec:results}.
+
+
+% ──────────────────────────────────────────────────────────────
+\section{Method Overview}
+\label{sec:method}
+% ──────────────────────────────────────────────────────────────
+
+The proposed pipeline consists of four stages:
+(1) baseline evaluation to measure the leakage gap;
+(2) leak-like case filtering;
+(3) channel sensitivity analysis via hidden-state forward hooks; and
+(4) inference-time selective channel suppression.
+All stages operate at inference time: no modification of model weights occurs at any
+point.
+
+\begin{figure}[h]
+\centering
+% \includegraphics[width=0.9\textwidth]{figures/pipeline.pdf}
+\placeholder{Pipeline figure: four boxes (Baseline Eval → Leak-Like Filter → Channel
+Sensitivity Analysis → Suppression Eval) with arrows. To be added.}
+\caption{Overview of the four-stage evaluation pipeline.
+No model weights are modified at any stage.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Stage 1: Baseline Evaluation}
+
+For each sample $(q_i, a_i, v_i)$ in the evaluation set, we run two inference passes
+using LLaVA-1.5-7B: one with the dummy image $v_{\emptyset}$ and one with the true
+image $v_i$.
+Answers are generated using greedy decoding with a maximum of 50 new tokens.
+We record whether each generated answer matches the target via a soft-match criterion
+(Section~\ref{sec:setup:eval}).
+The resulting per-sample records, including match flags for both conditions, are stored
+as a JSONL file and used in all downstream stages.
+
+\subsection{Stage 2: Leak-Like Case Filtering}
+
+From the baseline JSONL, we filter for leak-like cases as defined in
+Section~\ref{sec:problem}: instances where the image is available, the dummy-image
+response does not match the target, and the true-image response does.
+These cases form the primary analytical set for channel sensitivity analysis.
+The filter is applied programmatically and the resulting subset size is reported in
+experiments.
+
+\subsection{Stage 3: Channel Sensitivity Analysis}
+
+For each leak-like case $i \in \mathcal{L}$, we run two additional forward passes
+(with $v_{\emptyset}$ and $v_i$) while registering output hooks on selected transformer
+layers of the language model decoder.
+The hooks capture the full hidden state tensor $\mathbf{h} \in \mathbb{R}^{B \times T \times D}$
+at each hooked layer, where $B = 1$ is the batch size, $T$ is the sequence length,
+and $D = 4096$ is the hidden dimension for LLaVA-1.5-7B.
+
+The \emph{channel sensitivity score} for channel $c$ at layer $\ell$ is defined as:
+\begin{equation}
+  s_{\ell, c} = \frac{1}{|\mathcal{L}|} \sum_{i \in \mathcal{L}}
+    \frac{1}{T_i} \sum_{t=1}^{T_i}
+    \bigl| h^{v_i}_{\ell, t, c} - h^{v_{\emptyset}}_{\ell, t, c} \bigr|,
+  \label{eq:sensitivity}
+\end{equation}
+where $h^v_{\ell, t, c}$ is the value of channel $c$ at token position $t$ in layer
+$\ell$ when image $v$ is used.
+We compute $s_{\ell, c}$ for all channels and rank them in descending order to obtain
+a per-layer top-$k$ list of sensitive channels.
+The analysis is run on layers 28 and 31 of the LLaVA-1.5-7B language model backbone.
+
+This analysis is fully inference-time: the model weights are not updated, and the hook
+is removed after each forward pass.
+
+\subsection{Stage 4: Inference-Time Channel Suppression}
+
+Given the top-$k$ channel indices $\mathcal{C}_{\ell,k}$ for a target layer $\ell$,
+we implement suppression by registering a persistent forward hook during evaluation
+that modifies the layer output in-place:
+\begin{equation}
+  h'_{\ell, :, :, c} \leftarrow \alpha \cdot h_{\ell, :, :, c}
+  \quad \forall c \in \mathcal{C}_{\ell, k},
+  \label{eq:suppression}
+\end{equation}
+where $\alpha \in [0, 1]$ is a scalar suppression strength.
+At $\alpha = 0.0$, selected channels are zeroed out entirely.
+At $\alpha = 1.0$, the hook is a no-op and the model behaves as without suppression.
+Intermediate values of $\alpha$ implement partial suppression.
+
+The hook is implemented as a Python context manager using PyTorch's
+\texttt{register\_forward\_hook} API, allowing it to be applied cleanly around any
+\texttt{model.generate()} call without persistent side effects.
+No model parameters are modified, and the suppression is fully reversible.
+
+The method is related in spirit to representation-level information removal approaches
+such as nullspace projection~\citep{nullspace2020}, but is simpler and operates at
+inference time rather than requiring iterative training.
+It differs from fine-tuning-based MLLM unlearning methods~\citep{singleimage2024,
+mmunlearner2025} in that it does not update model weights and therefore has no risk of
+catastrophic forgetting of unrelated knowledge through gradient updates.
+
+\subsection{Computational Considerations}
+
+All experiments are run on a single GPU (Google Colab, NVIDIA A100 or equivalent)
+using 8-bit quantisation via \texttt{bitsandbytes}.
+The model is loaded once per evaluation run; the suppression hook adds no meaningful
+per-forward-pass overhead.
+Channel sensitivity analysis requires two forward passes per leak-like case (dummy and
+true image), but does not require generation---only a single full forward pass is needed
+to capture hidden states.
+
+
+% ──────────────────────────────────────────────────────────────
+\section{Experimental Setup}
+\label{sec:setup}
+% ──────────────────────────────────────────────────────────────
+
+\subsection{Model}
+
+All experiments use LLaVA-1.5-7B~\citep{clip2021}, a 7-billion-parameter
+multimodal language model consisting of a CLIP ViT-L/14 vision encoder, a two-layer
+MLP projection, and a Vicuna-1.5-7B language model backbone (32 transformer layers,
+hidden dimension 4096).
+The model is loaded from the Hugging Face Hub
+(\texttt{llava-hf/llava-1.5-7b-hf}) in 8-bit quantised form.
+The model has not been subjected to any unlearning procedure in our experiments;
+rather, we use the existing model as a stand-in for a post-unlearning system and
+evaluate cross-modal recovery as described below.
+All model weights are frozen throughout.
+
+\subsection{Dataset}
+
+We use a 50-sample subset of the UnLOK-VQA evaluation data~\citep{unlok2025}.
+UnLOK-VQA provides knowledge-grounded visual question-answering instances, each
+consisting of a factual question, a target answer (and associated aliases), and a COCO
+image identifier.
+Images are sourced from COCO 2017 (train and validation splits).
+All 50 images were successfully located; no image-loading errors occurred.
+
+\subsection{Dummy Image}
+
+The dummy image is a $336 \times 336$ blank white RGB frame
+($\mathtt{Image.new}(\text{``RGB''}, (336, 336), (255, 255, 255))$).
+This is intentionally uninformative: it occupies the image input slot without providing
+any semantic content.
+The dummy image serves as a no-information baseline to isolate the marginal contribution
+of a semantically relevant image to the model's correct-answer rate.
+
+\subsection{Prompt Format}
+
+All inference is performed using the LLaVA chat template:
+\begin{verbatim}
+USER: <image>
+{question}
+ASSISTANT:
+\end{verbatim}
+where \texttt{<image>} is the special image token and \texttt{\{question\}} is the
+factual question from the dataset.
+
+\subsection{Evaluation Criterion}
+\label{sec:setup:eval}
+
+We evaluate answer correctness using a \emph{soft match} criterion: the generated
+answer is considered correct if any of the target answer's aliases (as provided by the
+UnLOK-VQA dataset) appears as a normalised substring of the cleaned model output.
+Both answer and aliases are lower-cased and stripped of punctuation before comparison.
+This criterion is intentionally lenient to account for natural variation in how a model
+phrases a correct factual answer.
+
+\subsection{Layer Selection and Suppression Hyperparameters}
+
+Channel sensitivity analysis is performed on layers 28 and 31 of the language model
+backbone.
+These layers were chosen as representative late-stage decoder layers where cross-modal
+integration is expected to be substantial.
+In the suppression evaluation, we fix the target layer to layer 31, which shows
+stronger channel sensitivity scores than layer 28 in our analysis.
+
+The suppression sweep covers:
+\[
+  k \in \{1, 3, 5, 10\}, \qquad \alpha \in \{0.0, 0.2, 0.5, 1.0\}.
+\]
+This yields 16 (layer, $k$, $\alpha$) combinations.
+We report results for both the full 50-sample evaluation set and the leak-like subset.
+
+\subsection{Sanity Check}
+
+Before reporting suppression results, we verify that setting $\alpha = 1.0$ (no-op)
+reproduces the unsuppressed baseline hit rates on both the full set and the leak-like
+subset.
+This sanity check confirms that the hook implementation and evaluation path are
+functioning correctly.
+
+
+% ──────────────────────────────────────────────────────────────
+\section{Preliminary Results}
+\label{sec:results}
+% ──────────────────────────────────────────────────────────────
+
+All results reported in this section are preliminary.
+The evaluation is conducted on a small sample ($N = 50$) and should be treated as
+exploratory evidence rather than definitive conclusions.
+
+\subsection{Baseline Leakage Gap}
+
+Table~\ref{tab:baseline} summarises the baseline evaluation results.
+On the full 50-sample set, providing a semantically relevant image raises the model's
+soft-match hit rate from 0.260 (dummy image) to 0.540 (true image), yielding a leakage
+gap $\leakgap = +0.280$.
+
+\begin{table}[h]
+\centering
+\caption{Baseline evaluation results ($N = 50$, no suppression).}
+\label{tab:baseline}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Condition}           & \textbf{Soft Hit Rate} & \textbf{Leakage Gap $\leakgap$} \\
+\midrule
+Dummy image ($v_{\emptyset}$) & 0.260 & --- \\
+True image ($v_i$)            & 0.540 & $+0.280$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Of the 50 samples, 18 constitute leak-like cases: instances where the true image but not
+the dummy enables a correct answer.
+These 18 cases are the target of the channel sensitivity analysis and the primary
+evaluation set for the suppression experiments.
+
+The leakage gap of $+0.280$ is substantial relative to the base rate and provides
+clear initial evidence that semantically relevant images can recover factual information
+that is not accessible under the dummy-image condition.
+We do not claim that this constitutes a direct measurement of a known unlearning
+failure; the baseline model has not been explicitly unlearned.
+Rather, this result establishes the measurement framework and shows that the leakage
+operationalisation is capable of detecting a real signal.
+
+\subsection{Channel Sensitivity Analysis}
+
+Table~\ref{tab:channels} shows the highest-scoring channels identified for layers 28
+and 31 under the channel sensitivity analysis described in
+Equation~\eqref{eq:sensitivity}.
+The analysis was performed over 18 leak-like cases.
+
+\begin{table}[h]
+\centering
+\caption{Top-5 sensitive channels per layer (layer 31 scores are stronger).
+Full top-20 lists are available in \texttt{channel\_sensitivity.json}.}
+\label{tab:channels}
+\begin{tabular}{cll}
+\toprule
+\textbf{Layer} & \textbf{Top-5 Channel Indices} & \textbf{Top Sensitivity Score} \\
+\midrule
+28 & 1512, 2533, 1076, 1415, 2158 & 15.07 \\
+31 & 1512, 3241, 1360, 3556, 2660 & 30.30 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Layer 31 exhibits markedly stronger sensitivity than layer 28 (top score 30.30 versus
+15.07), suggesting that the cross-modal information relevant to leak-like cases is more
+concentrated and discriminative at this layer.
+Channel 1512 appears in the top-5 for both layers, which may indicate a consistently
+image-sensitive internal dimension across the late decoder.
+These observations motivate targeting layer 31 for suppression.
+
+\subsection{Sanity Check: Alpha = 1.0}
+
+Setting $\alpha = 1.0$ (suppression hook active but acting as a no-op) reproduces the
+unsuppressed baseline on both the full set ($r_{\text{true}} = 0.540$) and the
+leak-like subset ($r_{\text{true}} = 1.000$).
+This confirms that the hook registration and evaluation path are implemented correctly
+and that any effects observed under other $\alpha$ settings are attributable to the
+suppression itself.
+
+\subsection{Suppression Sweep: Full Set}
+
+Table~\ref{tab:sweep_full} reports suppression results on the full 50-sample evaluation
+set across the swept hyperparameters.
+
+\begin{table}[h]
+\centering
+\caption{Suppression sweep on the full evaluation set ($N = 50$, layer 31).
+$\delta = r_{\text{supp}} - r_{\text{true}}$.
+A negative $\delta$ indicates the suppressed rate is lower than the unsuppressed rate
+(desired direction); a positive $\delta$ is undesired.}
+\label{tab:sweep_full}
+\begin{tabular}{cccccc}
+\toprule
+$k$ & $\alpha$ & $r_{\text{dummy}}$ & $r_{\text{true}}$ & $r_{\text{supp}}$ & $\delta$ \\
+\midrule
+ 1 & 0.0 & 0.260 & 0.540 & \placeholder{x.xxx} & \placeholder{x.xxx} \\
+ 1 & 0.2 & 0.260 & 0.540 & \placeholder{x.xxx} & \placeholder{x.xxx} \\
+ 1 & 0.5 & 0.260 & 0.540 & \placeholder{x.xxx} & \placeholder{x.xxx} \\
+ 1 & 1.0 & 0.260 & 0.540 & 0.540 & 0.000 \\
+\midrule
+ 3 & 0.0 & 0.260 & 0.540 & \placeholder{x.xxx} & \placeholder{x.xxx} \\
+ 3 & 0.2 & 0.260 & 0.540 & \placeholder{x.xxx} & \placeholder{x.xxx} \\
+ 3 & 0.5 & 0.260 & 0.540 & \placeholder{x.xxx} & \placeholder{x.xxx} \\
+ 3 & 1.0 & 0.260 & 0.540 & 0.540 & 0.000 \\
+\midrule
+ 5 & 0.0 & 0.260 & 0.540 & 0.560 & $+0.020$ \\
+ 5 & 0.2 & 0.260 & 0.540 & \placeholder{x.xxx} & \placeholder{x.xxx} \\
+ 5 & 0.5 & 0.260 & 0.540 & \placeholder{x.xxx} & \placeholder{x.xxx} \\
+ 5 & 1.0 & 0.260 & 0.540 & 0.540 & 0.000 \\
+\midrule
+10 & 0.0 & 0.260 & 0.540 & \placeholder{x.xxx} & \placeholder{x.xxx} \\
+10 & 0.2 & 0.260 & 0.540 & \placeholder{x.xxx} & \placeholder{x.xxx} \\
+10 & 0.5 & 0.260 & 0.540 & \placeholder{x.xxx} & \placeholder{x.xxx} \\
+10 & 1.0 & 0.260 & 0.540 & 0.540 & 0.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key observation:} The full-set aggregate does not show a stable improvement
+under suppression.
+The one confirmed data point ($k=5$, $\alpha=0.0$) shows $r_{\text{supp}} = 0.560$,
+meaning the suppressed rate is \emph{slightly higher} than the unsuppressed true-image
+rate, in the wrong direction.
+The remaining cells are to be filled from the sweep output CSV.
+We report the current evidence without favourable selection.
+
+This result indicates that the method is \textbf{not yet a full-set improvement}.
+On the broader evaluation set, suppressing selected channels does not reliably decrease
+the model's ability to produce correct answers under image prompting.
+This may reflect the fact that the sensitive channels carry information relevant to
+correct answering on many samples, not only leak-like ones, so zeroing them has mixed
+effects across the full distribution.
+
+\subsection{Suppression Sweep: Leak-Like Subset}
+
+Table~\ref{tab:sweep_leak} reports suppression results restricted to the 18 leak-like
+cases, which represent the primary target of the method.
+
+\begin{table}[h]
+\centering
+\caption{Suppression sweep on the leak-like subset ($|\mathcal{L}| = 18$, layer 31).
+Good flips: $r_{\text{true}}=1 \to r_{\text{supp}}=0$ (desired).
+Bad flips: $r_{\text{true}}=0 \to r_{\text{supp}}=1$ (undesired).
+Note: $r_{\text{dummy}}$ and $r_{\text{true}}$ are fixed at 0.000 and 1.000
+by definition for this subset.}
+\label{tab:sweep_leak}
+\begin{tabular}{ccccc}
+\toprule
+$k$ & $\alpha$ & $r_{\text{supp}}$ & Good Flips & Bad Flips \\
+\midrule
+ 1 & 0.0 & \placeholder{x.xxx} & \placeholder{x} & \placeholder{x} \\
+ 1 & 0.2 & \placeholder{x.xxx} & \placeholder{x} & \placeholder{x} \\
+ 1 & 0.5 & \placeholder{x.xxx} & \placeholder{x} & \placeholder{x} \\
+ 1 & 1.0 & 1.000 & 0 & 0 \\
+\midrule
+ 3 & 0.0 & 0.737 & 5 & 0 \\
+ 3 & 0.2 & \placeholder{x.xxx} & \placeholder{x} & \placeholder{x} \\
+ 3 & 0.5 & \placeholder{x.xxx} & \placeholder{x} & \placeholder{x} \\
+ 3 & 1.0 & 1.000 & 0 & 0 \\
+\midrule
+ 5 & 0.0 & 0.632 & 7 & 0 \\
+ 5 & 0.2 & \placeholder{x.xxx} & \placeholder{x} & \placeholder{x} \\
+ 5 & 0.5 & \placeholder{x.xxx} & \placeholder{x} & \placeholder{x} \\
+ 5 & 1.0 & 1.000 & 0 & 0 \\
+\midrule
+10 & 0.0 & 0.632 & 7 & 0 \\
+10 & 0.2 & \placeholder{x.xxx} & \placeholder{x} & \placeholder{x} \\
+10 & 0.5 & \placeholder{x.xxx} & \placeholder{x} & \placeholder{x} \\
+10 & 1.0 & 1.000 & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key observations on the leak-like subset:}
+
+\begin{enumerate}[label=(\arabic*), itemsep=4pt]
+  \item By construction, the leak-like subset has $r_{\text{true}} = 1.000$ (all 18
+    cases produce a correct response under the true image) and
+    $r_{\text{dummy}} = 0.000$ (none produce a correct response under the dummy image).
+
+  \item Under $(k=5, \alpha=0.0)$, suppression reduces the recovery rate to $0.632$,
+    corresponding to seven cases where the model no longer produces a correct
+    answer after channel suppression.
+    No bad flips (cases where suppression erroneously introduces a new correct match)
+    occur within this subset.
+
+  \item The same seven-flip result is obtained at $(k=10, \alpha=0.0)$, suggesting
+    that beyond the top-5 channels, additional channels do not contribute further
+    suppression on these cases.
+
+  \item At $(k=3, \alpha=0.0)$, five good flips are observed, indicating that the
+    top-3 channels account for a substantial portion of the recoverable signal.
+
+  \item The absence of bad flips within the leak-like subset for the strongest
+    suppression settings is an encouraging sign that the method is not simply degrading
+    general output quality in a way that incidentally affects these cases; rather,
+    it appears to specifically disrupt the image-conditioned recovery pathway.
+\end{enumerate}
+
+\textbf{Interpretation:}
+These results provide \emph{preliminary evidence} that inference-time channel
+suppression can partially disrupt the cross-modal recovery pathway for a non-trivial
+fraction of leak-like cases.
+The best result (seven out of eighteen good flips, $1.000 \to 0.632$) represents a
+$36.8\%$ reduction in recovery rate on the leak-like subset.
+However, this evidence is tempered by several important limitations, which we discuss in
+Section~\ref{sec:limits}.
+
+
+% ──────────────────────────────────────────────────────────────
+\section{Limitations and Next Steps}
+\label{sec:limits}
+% ──────────────────────────────────────────────────────────────
+
+\subsection{Current Limitations}
+
+\paragraph{Sample size.}
+All experiments are conducted on $N = 50$ samples, of which only 18 are leak-like
+cases.
+Effect sizes are small in absolute terms (e.g., seven flips out of eighteen).
+Results may not generalise to larger evaluation sets, and the observed effects could
+partly reflect sampling variability.
+
+\paragraph{No established utility baseline.}
+We use the dummy-image hit rate ($r_{\text{dummy}} = 0.260$) as a proxy for utility
+preservation, on the assumption that suppression should leave dummy-condition behaviour
+largely unchanged.
+However, this is not a rigorous utility evaluation.
+We do not evaluate suppression on a retain set of unrelated knowledge, and we do not
+measure text-only generation quality.
+Whether the method preserves general language model capabilities under stronger
+suppression settings remains unknown.
+
+\paragraph{Full-set aggregate does not improve.}
+On the full 50-sample set, no tested combination of layer, $k$, and $\alpha$ produces
+a stable reduction in the overall hit rate under true-image prompting.
+The targeted effect on leak-like cases appears alongside neutral or slightly harmful
+effects on the broader set.
+A method that suppresses leakage only on the leak-like subset while leaving other
+image-conditioned responses unchanged would still represent a meaningful contribution,
+but this remains to be established more carefully.
+
+\paragraph{Single-layer suppression.}
+All reported suppression experiments target layer 31 only.
+The leakage pathway may involve multiple layers, and suppressing channels at a single
+late layer may insufficiently disrupt earlier cross-modal interactions.
+Multi-layer suppression (e.g., layers 28 and 31 jointly) has not yet been evaluated.
+
+\paragraph{No unlearning procedure applied.}
+The experiments in this thesis use the pre-unlearning LLaVA-1.5-7B model.
+We simulate the unlearning scenario by using the UnLOK-VQA benchmark framing, but do
+not apply an explicit unlearning method.
+Whether the observed leakage gap would persist after a genuine unlearning procedure---
+and whether channel sensitivity analysis on an unlearned model would produce different
+top channels---remains an open question.
+
+\paragraph{Sweep results partially pending.}
+Tables~\ref{tab:sweep_full} and~\ref{tab:sweep_leak} contain placeholder entries
+(marked \placeholder{x.xxx}) for sweep combinations whose results are not yet
+confirmed in writing.
+These will be filled from the output of \texttt{eval\_with\_suppression.py --sweep}
+before the thesis is finalised.
+
+\subsection{Planned Next Steps}
+
+\begin{enumerate}[label=(\arabic*), itemsep=4pt]
+  \item \textbf{Complete and fill sweep tables.}
+    Run the full $4 \times 4$ sweep for layer 31 and populate
+    Tables~\ref{tab:sweep_full} and~\ref{tab:sweep_leak} with all confirmed results.
+
+  \item \textbf{Add a retain-set utility check.}
+    Identify a set of general-knowledge VQA samples that are unrelated to the
+    forget set and evaluate dummy-image hit rate before and after suppression.
+    This would provide a more rigorous utility baseline than $r_{\text{dummy}}$ alone.
+
+  \item \textbf{Compare layer 28 versus layer 31.}
+    Run the matched $k \in \{1, 3, 5, 10\}$, $\alpha = 0.0$ sweep targeting layer 28
+    and compare leak-like subset results against layer 31 to characterise where the
+    cross-modal recovery signal is most concentrated.
+
+  \item \textbf{Evaluate a two-layer suppression variant.}
+    If the single-layer results are stable and interpretable, test simultaneous
+    suppression at layers 28 and 31 to assess whether additional coverage provides
+    further leakage reduction without disproportionate utility cost.
+
+  \item \textbf{Conduct experiments on an explicitly unlearned model.}
+    Apply a standard LLM unlearning method (e.g., gradient ascent on the forget set)
+    to LLaVA-1.5-7B and re-run the full pipeline on the resulting model.
+    This would make the threat model more realistic and directly test the hypothesis
+    that cross-modal leakage persists after text-side unlearning.
+
+  \item \textbf{Scale up the evaluation set.}
+    Extend the evaluation to at least 200 samples to obtain more reliable estimates
+    of the leakage gap and suppression effects.
+\end{enumerate}
+
+
+% ──────────────────────────────────────────────────────────────
+\section*{Appendix A: Statements Well Supported by Current Evidence}
+\addcontentsline{toc}{section}{Appendix A: Evidence Assessment}
+\label{app:evidence}
+% ──────────────────────────────────────────────────────────────
+
+The following statements are directly supported by the current experimental results and
+can be made with reasonable confidence in the thesis:
+
+\begin{enumerate}[leftmargin=*, itemsep=3pt]
+  \item A measurable leakage gap of $+0.280$ exists on the 50-sample evaluation set:
+    providing the semantically relevant image raises the hit rate from 0.260 to 0.540.
+  \item Eighteen out of fifty samples constitute leak-like cases where the true image,
+    but not the dummy image, enables a correct response.
+  \item The $\alpha = 1.0$ sanity check confirms the hook implementation is correct
+    (reproduces unsuppressed baseline).
+  \item On the leak-like subset, suppressing the top-5 channels in layer 31 reduces
+    the recovery rate from 1.000 to 0.632 with seven good flips and zero bad flips.
+  \item Layer 31 shows higher channel sensitivity scores than layer 28
+    (top score 30.30 vs.\ 15.07).
+  \item Channel 1512 is among the top-5 sensitive channels in both layers 28 and 31.
+\end{enumerate}
+
+% ──────────────────────────────────────────────────────────────
+\section*{Appendix B: Statements Needing Stronger Citations}
+\addcontentsline{toc}{section}{Appendix B: Citations Needed}
+\label{app:citations}
+% ──────────────────────────────────────────────────────────────
+
+The following statements currently lack sufficiently specific citation support and
+should be strengthened before submission:
+
+\begin{enumerate}[leftmargin=*, itemsep=3pt]
+  \item The claim that \emph{``late decoder layers are where cross-modal integration
+    is most substantial''} is stated without a mechanistic citation.
+    A paper on LLaVA's internal information flow or a probing analysis of late-layer
+    behaviour would strengthen this.
+  \item The claim that CLIP-based vision encoders facilitate \emph{``tight semantic
+    alignment''} that enables factual recovery needs a more specific empirical
+    reference, beyond \citet{clip2021}'s general alignment result.
+  \item The argument that channel suppression is \emph{``fully reversible and has no
+    risk of catastrophic forgetting''} is stated informally and would benefit from a
+    citation to the catastrophic forgetting literature for contrast.
+  \item The characterisation of the threat model as \emph{``mild and natural''}
+    relative to adversarial image attacks would be strengthened by citing at least
+    one representative adversarial visual prompt paper.
+\end{enumerate}
+
+% ──────────────────────────────────────────────────────────────
+\section*{Appendix C: Statements That Should Be Softened}
+\addcontentsline{toc}{section}{Appendix C: Softening Needed}
+\label{app:softening}
+% ──────────────────────────────────────────────────────────────
+
+The following statements in the current draft are either slightly overclaimed or
+could be read as stronger than the evidence warrants:
+
+\begin{enumerate}[leftmargin=*, itemsep=3pt]
+  \item \emph{``The leakage gap of $+0.280$ is substantial.''} The word
+    ``substantial'' is subjective. Prefer: \emph{``a leakage gap of $+0.280$ is
+    observed, which is large relative to the dummy-image base rate of 0.260.''} Do not
+    imply statistical significance has been established.
+  \item \emph{``The absence of bad flips is an encouraging sign that the method is
+    not simply degrading general output quality.''} This is too strong given the
+    small sample size. Prefer: \emph{``within the leak-like subset, no bad flips
+    were observed; however, the sample size is small and this observation should
+    be interpreted cautiously.''}
+  \item Any reference to the method showing \emph{``targeted suppression potential''}
+    should be hedged as \emph{``preliminary evidence of targeted suppression potential
+    on a small evaluation subset.''} Do not use language that implies the
+    generalisability of the finding.
+  \item The contribution statements in the Introduction list ``implement'' and
+    ``evaluate'' as completed contributions. The evaluation is preliminary.
+    Prefer: \emph{``we implement and provide an initial evaluation of\ldots''}.
+\end{enumerate}
+
+
+% ──────────────────────────────────────────────────────────────
+\section*{Appendix D: Supervisor Progress Email Draft}
+\addcontentsline{toc}{section}{Appendix D: Supervisor Email Draft}
+\label{app:email}
+% ──────────────────────────────────────────────────────────────
+
+\begin{quote}
+\noindent
+\textbf{Subject:} Honours Thesis Progress Update — Cross-Modal Leakage Experiments
+
+\medskip
+\noindent
+Dear \placeholder{Supervisor name},
+
+I wanted to give you a brief update on where the thesis experiments and writing
+currently stand.
+
+On the experimental side, I have completed three of the four pipeline stages.
+The baseline evaluation on 50 UnLOK-VQA samples shows a leakage gap of $+0.280$
+(dummy hit rate 0.260, true-image hit rate 0.540).
+Channel sensitivity analysis on 18 leak-like cases identifies layer 31 as the
+primary target, with a top-channel score of 30.30 versus 15.07 for layer 28.
+I have implemented inference-time channel suppression and run a preliminary
+sweep over $k \in \{1,3,5,10\}$ and $\alpha \in \{0.0,0.2,0.5,1.0\}$ on layer 31.
+
+The headline result at this stage is that suppression does not improve the full-set
+aggregate, but on the 18 leak-like cases, suppressing the top-5 channels at
+$\alpha=0.0$ reduces the recovery rate from 1.000 to 0.632, with 7 positive flips
+and 0 negative flips within that subset.
+I am treating this as preliminary mixed evidence and being careful not to overclaim.
+
+On the writing side, I have a first draft covering Introduction, Related Work,
+Problem Definition, Method Overview, Experimental Setup, and a Preliminary Results
+section.
+The results tables have some cells to fill once I confirm the full sweep CSV.
+
+The main gaps I am planning to address next are: (1) a retain-set utility check,
+(2) a layer-28 comparison, and (3) scaling up the evaluation set if time allows.
+
+I would very much welcome your feedback on the current draft, particularly on
+the framing of the leakage gap operationalisation and whether the contribution
+claims are appropriately scoped.
+I can share the draft at your convenience.
+
+Best regards,\\
+\placeholder{Student name}
+\end{quote}
+
+
+% ──────────────────────────────────────────────────────────────
+\section*{Appendix E: Next Experimental Results Needed}
+\addcontentsline{toc}{section}{Appendix E: Experimental Roadmap}
+\label{app:roadmap}
+% ──────────────────────────────────────────────────────────────
+
+The following experimental results are needed to complete or strengthen the thesis:
+
+\begin{itemize}[leftmargin=*, itemsep=4pt]
+  \item \textbf{Complete sweep CSV.}
+    Fill all placeholder cells in Tables~\ref{tab:sweep_full} and~\ref{tab:sweep_leak}
+    by running \texttt{eval\_with\_suppression.py --sweep} and reading the output CSVs.
+
+  \item \textbf{Retain-set utility evaluation.}
+    Identify $\approx 50$ general-knowledge VQA samples unrelated to the forget set;
+    measure dummy-image hit rate before and after suppression (layer 31, $k=5$,
+    $\alpha=0.0$). This directly tests whether suppression preserves utility.
+
+  \item \textbf{Layer 28 suppression comparison.}
+    Run the $k \in \{1,3,5,10\}$, $\alpha=0.0$ sweep for layer 28 and compare
+    leak-like good flips with layer 31. Determines whether layer targeting matters.
+
+  \item \textbf{Two-layer suppression result (optional).}
+    Run one setting (e.g., $k=5$ at both layers 28 and 31, $\alpha=0.0$) to check
+    whether joint suppression increases good flips beyond single-layer best.
+
+  \item \textbf{Full sweep for $\alpha \in \{0.2, 0.5\}$ on leak-like subset.}
+    Partial-suppression results are currently missing from Table~\ref{tab:sweep_leak}.
+    These are needed to characterise the $\alpha$--performance curve.
+
+  \item \textbf{Increased sample size.}
+    Re-run the baseline and best suppression setting on $N \geq 200$ samples to
+    get more reliable rate estimates and test whether the $+0.280$ gap holds at scale.
+\end{itemize}
+
+
+% ──────────────────────────────────────────────────────────────
+%  Bibliography
+% ──────────────────────────────────────────────────────────────
+
+\newpage
+\bibliography{references}
+
+\end{document}
