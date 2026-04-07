@@ -37,9 +37,11 @@ import argparse
 import json
 import math
 import random
+import traceback
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -108,10 +110,11 @@ class InputConditionedGate(nn.Module):
         Returns:
             gate: [B, k] values in [0, 1]
         """
-        x = self.pool_fn(h_k).to(self.fc1.weight.dtype)  # [B, k]
+        orig_dtype = h_k.dtype
+        x = self.pool_fn(h_k).to(torch.float32)  # [B, k]
         x = F.relu(self.fc1(x))     # [B, k]
         x = self.fc2(x)             # [B, k]
-        return torch.sigmoid(x).to(h_k.dtype)  # [B, k]
+        return torch.sigmoid(x).to(orig_dtype)  # [B, k]
 
     @torch.no_grad()
     def get_gate_values(self, h_k: torch.Tensor) -> torch.Tensor:
@@ -138,16 +141,20 @@ class GateHook:
     """
 
     def __init__(self, model, gate: InputConditionedGate,
-                 layer: int, channel_indices: list[int]):
+                 layer: int, channel_indices: list[int],
+                 capture_gate_values: bool = False):
         self.model = model
         self.gate = gate
         self.layer_idx = layer
         self.channel_indices = channel_indices
         self._handle = None
+        self.capture_gate_values = capture_gate_values
+        self.last_gate_values: Optional[torch.Tensor] = None
 
     def _make_hook(self):
         gate = self.gate
         ch_idx = self.channel_indices
+        hook_self = self
 
         def hook_fn(module, input, output):
             if isinstance(output, (tuple, list)):
@@ -164,6 +171,10 @@ class GateHook:
 
             # Predict per-sample gate: [B, k]
             g = gate(h_k)
+
+            # Capture gate values for diagnostics if requested
+            if hook_self.capture_gate_values:
+                hook_self.last_gate_values = g.detach().cpu().float()
 
             # Apply gate (broadcast over token dim)
             h = h.clone()
@@ -375,6 +386,8 @@ class GateTrainer:
         total_retain_loss = 0.0
         n_forget = 0
         n_retain = 0
+        n_fail = 0
+        printed_traceback = False
 
         all_samples = (
             [(s, "forget") for s in forget_set] +
@@ -406,6 +419,10 @@ class GateTrainer:
                 self.optimizer.step()
 
             except Exception as e:
+                n_fail += 1
+                if not printed_traceback:
+                    traceback.print_exc()
+                    printed_traceback = True
                 print(f"  Error on {sample['id']}: {e}")
                 continue
 
@@ -422,10 +439,11 @@ class GateTrainer:
             "avg_retain_loss": total_retain_loss / max(n_retain, 1),
             "n_forget": n_forget,
             "n_retain": n_retain,
+            "n_fail": n_fail,
         }
 
     def evaluate(self, forget_set: list[dict], retain_set: list[dict]) -> dict:
-        """Measure gated vs ungated hit rates on forget and retain sets."""
+        """Measure gated vs ungated hit rates and capture gate diagnostics."""
         from PIL import Image
         from minimal_eval_unlok import clean_answer, run_with_image, soft_match
 
@@ -445,15 +463,36 @@ class GateTrainer:
                 ungated_answer = clean_answer(raw_ungated)
                 ungated_match = soft_match(target, ungated_answer)
 
-                # Gated
-                with GateHook(self.model, self.gate, self.layer,
-                              self.channel_indices):
+                # Gated (with gate value capture)
+                diag_hook = GateHook(
+                    self.model, self.gate, self.layer,
+                    self.channel_indices, capture_gate_values=True,
+                )
+                with diag_hook:
                     raw_gated = run_with_image(
                         self.model, self.processor,
                         sample["question"], img, self.device
                     )
                 gated_answer = clean_answer(raw_gated)
                 gated_match = soft_match(target, gated_answer)
+
+                # Classify flip type
+                if ungated_match and not gated_match:
+                    flip_type = "good_flip"
+                elif not ungated_match and gated_match:
+                    flip_type = "bad_flip"
+                else:
+                    flip_type = "unchanged"
+
+                # Gate values from the last forward pass during generate
+                gate_vec = diag_hook.last_gate_values
+                if gate_vec is not None:
+                    gate_vec = gate_vec.squeeze(0)  # [k]
+                    gate_list = gate_vec.tolist()
+                    gate_mean = gate_vec.mean().item()
+                else:
+                    gate_list = []
+                    gate_mean = float("nan")
 
                 results[split_name].append({
                     "id": sample["id"],
@@ -462,6 +501,9 @@ class GateTrainer:
                     "gated_match": gated_match,
                     "ungated_answer": ungated_answer,
                     "gated_answer": gated_answer,
+                    "flip_type": flip_type,
+                    "gate_values": gate_list,
+                    "gate_mean": gate_mean,
                 })
 
         def rate(records, key):
@@ -474,12 +516,10 @@ class GateTrainer:
         retain_gated = rate(results["retain"], "gated_match")
 
         forget_good_flips = sum(
-            1 for r in results["forget"]
-            if r["ungated_match"] and not r["gated_match"]
+            1 for r in results["forget"] if r["flip_type"] == "good_flip"
         )
         forget_bad_flips = sum(
-            1 for r in results["forget"]
-            if not r["ungated_match"] and r["gated_match"]
+            1 for r in results["forget"] if r["flip_type"] == "bad_flip"
         )
 
         return {
@@ -493,6 +533,84 @@ class GateTrainer:
             "n_retain": len(results["retain"]),
             "details": results,
         }
+
+    def build_diagnostics(self, eval_results: dict,
+                          channel_indices: list[int]) -> dict:
+        """
+        Aggregate gate diagnostics from evaluation results.
+
+        Returns a dict ready to be saved as gate_diagnostics.json.
+        """
+        details = eval_results["details"]
+        diag = {"channel_indices": channel_indices, "splits": {}}
+
+        for split_name in ["forget", "retain"]:
+            records = details[split_name]
+            if not records:
+                continue
+
+            gate_matrix = np.array(
+                [r["gate_values"] for r in records if r["gate_values"]],
+                dtype=np.float64,
+            )
+            if gate_matrix.size == 0:
+                continue
+
+            per_channel_mean = gate_matrix.mean(axis=0).tolist()
+            per_channel_std = gate_matrix.std(axis=0).tolist()
+
+            diag["splits"][split_name] = {
+                "n_samples": len(records),
+                "overall_gate_mean": float(gate_matrix.mean()),
+                "overall_gate_std": float(gate_matrix.std()),
+                "per_channel_mean": [round(v, 4) for v in per_channel_mean],
+                "per_channel_std": [round(v, 4) for v in per_channel_std],
+                "samples": [
+                    {
+                        "id": r["id"],
+                        "gate_mean": round(r["gate_mean"], 4),
+                        "gate_values": [round(v, 4) for v in r["gate_values"]],
+                        "flip_type": r["flip_type"],
+                        "ungated_answer": r["ungated_answer"],
+                        "gated_answer": r["gated_answer"],
+                    }
+                    for r in records
+                ],
+            }
+
+        return diag
+
+    @staticmethod
+    def print_diagnostics_summary(diag: dict):
+        """Print a concise gate diagnostics summary to stdout."""
+        ch = diag["channel_indices"]
+        print("\n===== GATE DIAGNOSTICS =====")
+        print(f"Channels: {ch}")
+
+        for split_name in ["forget", "retain"]:
+            info = diag["splits"].get(split_name)
+            if info is None:
+                continue
+            print(f"\n  {split_name} ({info['n_samples']} samples):")
+            print(f"    mean gate:        {info['overall_gate_mean']:.4f} "
+                  f"+/- {info['overall_gate_std']:.4f}")
+            per_ch = info["per_channel_mean"]
+            print(f"    per-channel mean: {[round(v, 4) for v in per_ch]}")
+
+        # Separation summary
+        f_info = diag["splits"].get("forget")
+        r_info = diag["splits"].get("retain")
+        if f_info and r_info:
+            sep = r_info["overall_gate_mean"] - f_info["overall_gate_mean"]
+            print(f"\n  retain - forget gap: {sep:+.4f}")
+            print(f"  (positive = gate more open on retain = desired behaviour)")
+            if abs(sep) < 0.02:
+                print("  ** WARNING: gate outputs nearly identical on both splits")
+                print("     The gate may not be learning to distinguish them.")
+            print(f"\n  For comparison, fixed suppression (alpha=0) sets gate = 0")
+            print(f"  on ALL inputs. Current learned gate averages:")
+            print(f"    forget: {f_info['overall_gate_mean']:.4f}")
+            print(f"    retain: {r_info['overall_gate_mean']:.4f}")
 
     def save(self, output_dir: Path):
         """Save gate weights, channel indices, and config."""
@@ -613,14 +731,14 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Train an input-conditioned channel gate for leakage suppression"
     )
-    p.add_argument("--data_path", required=True,
-                   help="Path to zsre_mend_eval.json")
-    p.add_argument("--coco_root", required=True,
-                   help="Root of COCO images (train2017/ and val2017/)")
-    p.add_argument("--baseline_jsonl", required=True,
-                   help="Output of minimal_eval_unlok.py")
-    p.add_argument("--sensitivity_json", required=True,
-                   help="channel_sensitivity.json from analyze_channels.py")
+    p.add_argument("--data_path",
+                   help="Path to zsre_mend_eval.json (required for training)")
+    p.add_argument("--coco_root",
+                   help="Root of COCO images (train2017/ and val2017/) (required for training)")
+    p.add_argument("--baseline_jsonl",
+                   help="Output of minimal_eval_unlok.py (required for training)")
+    p.add_argument("--sensitivity_json",
+                   help="channel_sensitivity.json from analyze_channels.py (required for training)")
     p.add_argument("--output_dir", default="results/gate_v2",
                    help="Directory to save gate weights and logs")
     p.add_argument("--layer", type=int, default=31,
@@ -633,8 +751,10 @@ def parse_args():
                    help="Learning rate (default: 0.01)")
     p.add_argument("--lambda_retain", type=float, default=1.0,
                    help="Weight of retain loss (default: 1.0)")
-    p.add_argument("--final_bias", type=float, default=2.0,
-                   help="Initial bias for gate output layer (default: 2.0, sigmoid~0.88)")
+    p.add_argument("--gate_init_bias", type=float, default=2.0,
+                   help="Initial bias for gate output layer. "
+                        "sigmoid(2.0)~0.88, sigmoid(1.0)~0.73, sigmoid(0.0)=0.50. "
+                        "Lower = more aggressive initial suppression (default: 2.0)")
     p.add_argument("--model_id", default="llava-hf/llava-1.5-7b-hf")
     p.add_argument("--no_quantize", action="store_true",
                    help="Disable 8-bit quantization")
@@ -654,6 +774,20 @@ def main():
     if args.smoke_test:
         smoke_test()
         return 0
+
+    # Validate required training arguments now that smoke_test is ruled out
+    missing = [
+        name for name, val in [
+            ("--data_path", args.data_path),
+            ("--coco_root", args.coco_root),
+            ("--baseline_jsonl", args.baseline_jsonl),
+            ("--sensitivity_json", args.sensitivity_json),
+        ] if val is None
+    ]
+    if missing:
+        import sys
+        print(f"error: the following arguments are required for training: {', '.join(missing)}")
+        sys.exit(2)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -698,12 +832,12 @@ def main():
 
     # -- create gate --
     k = len(channel_indices)
-    gate = InputConditionedGate(k=k, final_bias_init=args.final_bias)
+    gate = InputConditionedGate(k=k, final_bias_init=args.gate_init_bias)
 
     # Move gate to same device as the target layer
     layers = get_language_layers(model)
     layer_device = next(layers[args.layer].parameters()).device
-    gate = gate.to(layer_device)
+    gate = gate.to(device=layer_device, dtype=torch.float32)
 
     n_params = sum(p.numel() for p in gate.parameters())
     print(f"Gate created: k={k}, {n_params} trainable parameters")
@@ -724,7 +858,8 @@ def main():
         log.append(stats)
         print(f"\n  Epoch {stats['epoch']}: "
               f"forget_loss={stats['avg_forget_loss']:.4f}  "
-              f"retain_loss={stats['avg_retain_loss']:.4f}")
+              f"retain_loss={stats['avg_retain_loss']:.4f}  "
+              f"failures={stats['n_fail']}")
 
     # -- save --
     trainer.save(output_dir)
@@ -751,6 +886,22 @@ def main():
     with open(output_dir / "eval_results.json", "w") as f:
         json.dump(eval_out, f, indent=2)
     print(f"Eval results: {output_dir / 'eval_results.json'}")
+
+    # -- gate diagnostics --
+    diag = trainer.build_diagnostics(eval_results, channel_indices)
+    diag["config"] = {
+        "layer": args.layer,
+        "topk": args.topk,
+        "gate_init_bias": args.gate_init_bias,
+        "lr": args.lr,
+        "lambda_retain": args.lambda_retain,
+        "epochs": args.epochs,
+    }
+    with open(output_dir / "gate_diagnostics.json", "w") as f:
+        json.dump(diag, f, indent=2)
+    print(f"Gate diagnostics: {output_dir / 'gate_diagnostics.json'}")
+
+    trainer.print_diagnostics_summary(diag)
 
     return 0
 
