@@ -359,7 +359,9 @@ class GateTrainer:
                  channel_indices: list[int],
                  device: str,
                  lr: float = 0.01,
-                 lambda_retain: float = 1.0):
+                 lambda_retain: float = 1.0,
+                 lambda_gate_retain: float = 0.0,
+                 lambda_gate_forget: float = 0.0):
         self.model = model
         self.processor = processor
         self.gate = gate
@@ -367,6 +369,8 @@ class GateTrainer:
         self.channel_indices = channel_indices
         self.device = device
         self.lambda_retain = lambda_retain
+        self.lambda_gate_retain = lambda_gate_retain
+        self.lambda_gate_forget = lambda_gate_forget
 
         # Freeze all model parameters
         for p in model.parameters():
@@ -380,6 +384,7 @@ class GateTrainer:
                     epoch: int) -> dict:
         """Run one epoch. Returns loss stats."""
         self.gate.train()
+        self.gate_hook.capture_gate_values = True
         self.gate_hook.register()
 
         total_forget_loss = 0.0
@@ -401,17 +406,35 @@ class GateTrainer:
 
             try:
                 if split == "forget":
-                    loss = compute_forget_loss(
+                    task_loss = compute_forget_loss(
                         self.model, self.processor, sample, self.device
                     )
-                    total_forget_loss += loss.item()
+
+                    loss = task_loss
+
+                    gate_values = self.gate_hook.last_gate_values
+                    if gate_values is not None and self.lambda_gate_forget > 0:
+                        gate_values = gate_values.to(task_loss.device, dtype=torch.float32)
+                        gate_loss = (gate_values ** 2).mean()
+                        loss = loss + self.lambda_gate_forget * gate_loss
+
+                    total_forget_loss += task_loss.item()
                     n_forget += 1
+
                 else:
-                    loss = compute_retain_loss(
+                    task_loss = compute_retain_loss(
                         self.model, self.processor, sample, self.device
                     )
-                    loss = loss * self.lambda_retain
-                    total_retain_loss += loss.item()
+
+                    loss = self.lambda_retain * task_loss
+
+                    gate_values = self.gate_hook.last_gate_values
+                    if gate_values is not None and self.lambda_gate_retain > 0:
+                        gate_values = gate_values.to(task_loss.device, dtype=torch.float32)
+                        gate_loss = ((gate_values - 1.0) ** 2).mean()
+                        loss = loss + self.lambda_gate_retain * gate_loss
+
+                    total_retain_loss += task_loss.item()
                     n_retain += 1
 
                 loss.backward()
@@ -751,6 +774,10 @@ def parse_args():
                    help="Learning rate (default: 0.01)")
     p.add_argument("--lambda_retain", type=float, default=1.0,
                    help="Weight of retain loss (default: 1.0)")
+    p.add_argument("--lambda_gate_retain", type=float, default=0.0,
+               help="Penalty weight that keeps retain gates close to 1.0")
+    p.add_argument("--lambda_gate_forget", type=float, default=0.0,
+               help="Penalty weight that pushes forget gates close to 0.0")
     p.add_argument("--gate_init_bias", type=float, default=2.0,
                    help="Initial bias for gate output layer. "
                         "sigmoid(2.0)~0.88, sigmoid(1.0)~0.73, sigmoid(0.0)=0.50. "
@@ -850,6 +877,8 @@ def main():
         device=device,
         lr=args.lr,
         lambda_retain=args.lambda_retain,
+        lambda_gate_retain=args.lambda_gate_retain,
+        lambda_gate_forget=args.lambda_gate_forget,
     )
 
     log = []
@@ -895,6 +924,8 @@ def main():
         "gate_init_bias": args.gate_init_bias,
         "lr": args.lr,
         "lambda_retain": args.lambda_retain,
+        "lambda_gate_retain": args.lambda_gate_retain,
+        "lambda_gate_forget": args.lambda_gate_forget,
         "epochs": args.epochs,
     }
     with open(output_dir / "gate_diagnostics.json", "w") as f:
