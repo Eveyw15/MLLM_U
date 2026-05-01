@@ -150,6 +150,7 @@ class GateHook:
         self._handle = None
         self.capture_gate_values = capture_gate_values
         self.last_gate_values: Optional[torch.Tensor] = None
+        self.last_gate_values_train = None
 
     def _make_hook(self):
         gate = self.gate
@@ -173,6 +174,8 @@ class GateHook:
             g = gate(h_k)
 
             # Capture gate values for diagnostics if requested
+            hook_self.last_gate_values_train = g
+
             if hook_self.capture_gate_values:
                 hook_self.last_gate_values = g.detach().cpu().float()
 
@@ -412,9 +415,8 @@ class GateTrainer:
 
                     loss = task_loss
 
-                    gate_values = self.gate_hook.last_gate_values
+                    gate_values = self.gate_hook.last_gate_values_train
                     if gate_values is not None and self.lambda_gate_forget > 0:
-                        gate_values = gate_values.to(task_loss.device, dtype=torch.float32)
                         gate_loss = (gate_values ** 2).mean()
                         loss = loss + self.lambda_gate_forget * gate_loss
 
