@@ -375,7 +375,10 @@ class GateTrainer:
                  lambda_gate_retain: float = 0.0,
                  lambda_gate_forget: float = 0.0,
                  lambda_selectivity: float = 0.0,
-                 selectivity_margin: float = 0.2):
+                 selectivity_margin: float = 0.2,
+                 lambda_gate_band: float = 0.0,
+                 forget_gate_ceiling: float = 0.18,
+                 retain_gate_floor: float = 0.35):
         self.model = model
         self.processor = processor
         self.gate = gate
@@ -387,6 +390,9 @@ class GateTrainer:
         self.lambda_gate_forget = lambda_gate_forget
         self.lambda_selectivity = lambda_selectivity
         self.selectivity_margin = selectivity_margin
+        self.lambda_gate_band = lambda_gate_band
+        self.forget_gate_ceiling = forget_gate_ceiling
+        self.retain_gate_floor = retain_gate_floor
 
         # Freeze all model parameters
         for p in model.parameters():
@@ -399,7 +405,7 @@ class GateTrainer:
     def train_epoch(self, forget_set: list[dict], retain_set: list[dict],
                     epoch: int) -> dict:
         """Run one epoch. Returns loss stats."""
-        if self.lambda_selectivity > 0.0:
+        if self.lambda_selectivity > 0.0 or self.lambda_gate_band > 0.0:
             return self.train_epoch_paired(forget_set, retain_set, epoch)
 
         self.gate.train()
@@ -498,9 +504,14 @@ class GateTrainer:
             "avg_forget_loss": total_forget_loss / max(n_forget, 1),
             "avg_retain_loss": total_retain_loss / max(n_retain, 1),
             "avg_selectivity_loss": 0.0,
+            "avg_gate_band_loss": 0.0,
+            "avg_forget_ceiling_loss": 0.0,
+            "avg_retain_floor_loss": 0.0,
             "avg_forget_gate_mean": avg_forget_gate_mean,
             "avg_retain_gate_mean": avg_retain_gate_mean,
             "avg_gate_gap": avg_retain_gate_mean - avg_forget_gate_mean,
+            "forget_gate_ceiling": self.forget_gate_ceiling,
+            "retain_gate_floor": self.retain_gate_floor,
             "n_forget": n_forget,
             "n_retain": n_retain,
             "n_fail": n_fail,
@@ -521,6 +532,9 @@ class GateTrainer:
         total_forget_loss = 0.0
         total_retain_loss = 0.0
         total_selectivity_loss = 0.0
+        total_gate_band_loss = 0.0
+        total_forget_ceiling_loss = 0.0
+        total_retain_floor_loss = 0.0
         total_forget_gate_mean = 0.0
         total_retain_gate_mean = 0.0
         total_gate_gap = 0.0
@@ -575,6 +589,23 @@ class GateTrainer:
                     selectivity_loss = F.relu(selectivity_margin - gate_gap)
                     forget_gate_penalty = (forget_gate_values ** 2).mean()
                     retain_gate_penalty = ((retain_gate_values - 1.0) ** 2).mean()
+                    forget_gate_ceiling = torch.tensor(
+                        self.forget_gate_ceiling,
+                        device=forget_gate_mean.device,
+                        dtype=forget_gate_mean.dtype,
+                    )
+                    retain_gate_floor = torch.tensor(
+                        self.retain_gate_floor,
+                        device=retain_gate_mean.device,
+                        dtype=retain_gate_mean.dtype,
+                    )
+                    forget_ceiling_loss = F.relu(
+                        forget_gate_mean - forget_gate_ceiling
+                    ).pow(2)
+                    retain_floor_loss = F.relu(
+                        retain_gate_floor - retain_gate_mean
+                    ).pow(2)
+                    gate_band_loss = forget_ceiling_loss + retain_floor_loss
 
                     loss = (
                         forget_loss
@@ -582,6 +613,7 @@ class GateTrainer:
                         + self.lambda_gate_forget * forget_gate_penalty
                         + self.lambda_gate_retain * retain_gate_penalty
                         + self.lambda_selectivity * selectivity_loss
+                        + self.lambda_gate_band * gate_band_loss
                     )
 
                     loss.backward()
@@ -591,6 +623,9 @@ class GateTrainer:
                     total_forget_loss += forget_loss.item()
                     total_retain_loss += retain_loss.item()
                     total_selectivity_loss += selectivity_loss.item()
+                    total_gate_band_loss += gate_band_loss.item()
+                    total_forget_ceiling_loss += forget_ceiling_loss.item()
+                    total_retain_floor_loss += retain_floor_loss.item()
                     total_forget_gate_mean += forget_gate_mean.item()
                     total_retain_gate_mean += retain_gate_mean.item()
                     total_gate_gap += gate_gap.item()
@@ -612,6 +647,7 @@ class GateTrainer:
                     "f_loss": f"{total_forget_loss / (n_success or 1):.3f}",
                     "r_loss": f"{total_retain_loss / (n_success or 1):.3f}",
                     "sel": f"{total_selectivity_loss / (n_success or 1):.3f}",
+                    "band": f"{total_gate_band_loss / (n_success or 1):.3f}",
                     "gap": f"{total_gate_gap / (n_success or 1):+.3f}",
                 })
         finally:
@@ -622,9 +658,14 @@ class GateTrainer:
             "avg_forget_loss": total_forget_loss / max(n_success, 1),
             "avg_retain_loss": total_retain_loss / max(n_success, 1),
             "avg_selectivity_loss": total_selectivity_loss / max(n_success, 1),
+            "avg_gate_band_loss": total_gate_band_loss / max(n_success, 1),
+            "avg_forget_ceiling_loss": total_forget_ceiling_loss / max(n_success, 1),
+            "avg_retain_floor_loss": total_retain_floor_loss / max(n_success, 1),
             "avg_forget_gate_mean": total_forget_gate_mean / max(n_success, 1),
             "avg_retain_gate_mean": total_retain_gate_mean / max(n_success, 1),
             "avg_gate_gap": total_gate_gap / max(n_success, 1),
+            "forget_gate_ceiling": self.forget_gate_ceiling,
+            "retain_gate_floor": self.retain_gate_floor,
             "n_steps": n_steps,
             "n_success": n_success,
             "n_forget": n_success,
@@ -949,6 +990,12 @@ def parse_args():
                    help="Weight of paired retain-vs-forget gate selectivity loss")
     p.add_argument("--selectivity_margin", type=float, default=0.2,
                    help="Desired retain minus forget mean-gate margin")
+    p.add_argument("--lambda_gate_band", type=float, default=0.0,
+                   help="Weight of paired target-band gate loss")
+    p.add_argument("--forget_gate_ceiling", type=float, default=0.18,
+                   help="Target upper bound for forget mean gate")
+    p.add_argument("--retain_gate_floor", type=float, default=0.35,
+                   help="Target lower bound for retain mean gate")
     p.add_argument("--gate_init_bias", type=float, default=2.0,
                    help="Initial bias for gate output layer. "
                         "sigmoid(2.0)~0.88, sigmoid(1.0)~0.73, sigmoid(0.0)=0.50. "
@@ -1052,6 +1099,9 @@ def main():
         lambda_gate_forget=args.lambda_gate_forget,
         lambda_selectivity=args.lambda_selectivity,
         selectivity_margin=args.selectivity_margin,
+        lambda_gate_band=args.lambda_gate_band,
+        forget_gate_ceiling=args.forget_gate_ceiling,
+        retain_gate_floor=args.retain_gate_floor,
     )
 
     log = []
@@ -1062,6 +1112,7 @@ def main():
               f"forget_loss={stats['avg_forget_loss']:.4f}  "
               f"retain_loss={stats['avg_retain_loss']:.4f}  "
               f"selectivity_loss={stats['avg_selectivity_loss']:.4f}  "
+              f"band_loss={stats['avg_gate_band_loss']:.4f}  "
               f"gate_gap={stats['avg_gate_gap']:+.4f}  "
               f"failures={stats['n_fail']}")
 
@@ -1103,6 +1154,9 @@ def main():
         "lambda_gate_forget": args.lambda_gate_forget,
         "lambda_selectivity": args.lambda_selectivity,
         "selectivity_margin": args.selectivity_margin,
+        "lambda_gate_band": args.lambda_gate_band,
+        "forget_gate_ceiling": args.forget_gate_ceiling,
+        "retain_gate_floor": args.retain_gate_floor,
         "epochs": args.epochs,
     }
     with open(output_dir / "gate_diagnostics.json", "w") as f:
