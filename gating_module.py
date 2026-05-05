@@ -19,6 +19,10 @@ Training loss:
     L = L_forget + lambda_retain * L_retain
     L_forget = -cross_entropy(target | true_image, gated_model)
     L_retain =  cross_entropy(original_output | image, gated_model)
+    Optional paired selectivity:
+        L += lambda_selectivity * relu(
+            selectivity_margin - (mean(g_retain) - mean(g_forget))
+        )
 
 Usage (training):
     python gating_module.py \
@@ -158,6 +162,11 @@ class GateHook:
         hook_self = self
 
         def hook_fn(module, input, output):
+            # Reset per forward so training never reuses a stale gate tensor.
+            hook_self.last_gate_values_train = None
+            if hook_self.capture_gate_values:
+                hook_self.last_gate_values = None
+
             if isinstance(output, (tuple, list)):
                 h = output[0]
                 rest = output[1:]
@@ -364,7 +373,9 @@ class GateTrainer:
                  lr: float = 0.01,
                  lambda_retain: float = 1.0,
                  lambda_gate_retain: float = 0.0,
-                 lambda_gate_forget: float = 0.0):
+                 lambda_gate_forget: float = 0.0,
+                 lambda_selectivity: float = 0.0,
+                 selectivity_margin: float = 0.2):
         self.model = model
         self.processor = processor
         self.gate = gate
@@ -374,6 +385,8 @@ class GateTrainer:
         self.lambda_retain = lambda_retain
         self.lambda_gate_retain = lambda_gate_retain
         self.lambda_gate_forget = lambda_gate_forget
+        self.lambda_selectivity = lambda_selectivity
+        self.selectivity_margin = selectivity_margin
 
         # Freeze all model parameters
         for p in model.parameters():
@@ -386,12 +399,19 @@ class GateTrainer:
     def train_epoch(self, forget_set: list[dict], retain_set: list[dict],
                     epoch: int) -> dict:
         """Run one epoch. Returns loss stats."""
+        if self.lambda_selectivity > 0.0:
+            return self.train_epoch_paired(forget_set, retain_set, epoch)
+
         self.gate.train()
-        self.gate_hook.capture_gate_values = True
+        self.gate_hook.capture_gate_values = False
         self.gate_hook.register()
 
         total_forget_loss = 0.0
         total_retain_loss = 0.0
+        total_forget_gate_mean = 0.0
+        total_retain_gate_mean = 0.0
+        n_forget_gate = 0
+        n_retain_gate = 0
         n_forget = 0
         n_retain = 0
         n_fail = 0
@@ -409,6 +429,7 @@ class GateTrainer:
 
             try:
                 if split == "forget":
+                    self.gate_hook.last_gate_values_train = None
                     task_loss = compute_forget_loss(
                         self.model, self.processor, sample, self.device
                     )
@@ -416,25 +437,37 @@ class GateTrainer:
                     loss = task_loss
 
                     gate_values = self.gate_hook.last_gate_values_train
-                    if gate_values is not None and self.lambda_gate_forget > 0:
-                        gate_loss = (gate_values ** 2).mean()
-                        loss = loss + self.lambda_gate_forget * gate_loss
+                    if gate_values is not None:
+                        gate_values = gate_values.float()
+                        if loss.device != gate_values.device:
+                            loss = loss.to(gate_values.device)
+                        total_forget_gate_mean += gate_values.mean().item()
+                        n_forget_gate += 1
+                        if self.lambda_gate_forget > 0:
+                            gate_loss = (gate_values ** 2).mean()
+                            loss = loss + self.lambda_gate_forget * gate_loss
 
                     total_forget_loss += task_loss.item()
                     n_forget += 1
 
                 else:
+                    self.gate_hook.last_gate_values_train = None
                     task_loss = compute_retain_loss(
                         self.model, self.processor, sample, self.device
                     )
 
                     loss = self.lambda_retain * task_loss
 
-                    gate_values = self.gate_hook.last_gate_values
-                    if gate_values is not None and self.lambda_gate_retain > 0:
-                        gate_values = gate_values.to(task_loss.device, dtype=torch.float32)
-                        gate_loss = ((gate_values - 1.0) ** 2).mean()
-                        loss = loss + self.lambda_gate_retain * gate_loss
+                    gate_values = self.gate_hook.last_gate_values_train
+                    if gate_values is not None:
+                        gate_values = gate_values.float()
+                        if loss.device != gate_values.device:
+                            loss = loss.to(gate_values.device)
+                        total_retain_gate_mean += gate_values.mean().item()
+                        n_retain_gate += 1
+                        if self.lambda_gate_retain > 0:
+                            gate_loss = ((gate_values - 1.0) ** 2).mean()
+                            loss = loss + self.lambda_gate_retain * gate_loss
 
                     total_retain_loss += task_loss.item()
                     n_retain += 1
@@ -457,13 +490,145 @@ class GateTrainer:
             })
 
         self.gate_hook.remove()
+        avg_forget_gate_mean = total_forget_gate_mean / max(n_forget_gate, 1)
+        avg_retain_gate_mean = total_retain_gate_mean / max(n_retain_gate, 1)
 
         return {
             "epoch": epoch + 1,
             "avg_forget_loss": total_forget_loss / max(n_forget, 1),
             "avg_retain_loss": total_retain_loss / max(n_retain, 1),
+            "avg_selectivity_loss": 0.0,
+            "avg_forget_gate_mean": avg_forget_gate_mean,
+            "avg_retain_gate_mean": avg_retain_gate_mean,
+            "avg_gate_gap": avg_retain_gate_mean - avg_forget_gate_mean,
             "n_forget": n_forget,
             "n_retain": n_retain,
+            "n_fail": n_fail,
+        }
+
+    def train_epoch_paired(self, forget_set: list[dict], retain_set: list[dict],
+                           epoch: int) -> dict:
+        """Run paired forget-retain training for one epoch."""
+        if not forget_set:
+            raise ValueError("Paired training requires at least one forget sample")
+        if not retain_set:
+            raise ValueError("Paired training requires at least one retain sample")
+
+        self.gate.train()
+        self.gate_hook.capture_gate_values = False
+        self.gate_hook.register()
+
+        total_forget_loss = 0.0
+        total_retain_loss = 0.0
+        total_selectivity_loss = 0.0
+        total_forget_gate_mean = 0.0
+        total_retain_gate_mean = 0.0
+        total_gate_gap = 0.0
+        n_success = 0
+        n_fail = 0
+        printed_traceback = False
+        n_steps = max(len(forget_set), len(retain_set))
+
+        pbar = tqdm(range(n_steps), desc=f"Epoch {epoch + 1} paired")
+        try:
+            for _ in pbar:
+                forget_sample = random.choice(forget_set)
+                retain_sample = random.choice(retain_set)
+                self.optimizer.zero_grad()
+
+                try:
+                    self.gate_hook.last_gate_values_train = None
+                    forget_loss = compute_forget_loss(
+                        self.model, self.processor, forget_sample, self.device
+                    )
+                    forget_gate_values = self.gate_hook.last_gate_values_train
+                    if forget_gate_values is None:
+                        raise RuntimeError(
+                            "Gate hook did not capture differentiable forget gate values"
+                        )
+                    forget_gate_values = forget_gate_values.float()
+                    loss_device = forget_gate_values.device
+                    forget_loss = forget_loss.to(loss_device)
+
+                    self.gate_hook.last_gate_values_train = None
+                    retain_loss = compute_retain_loss(
+                        self.model, self.processor, retain_sample, self.device
+                    )
+                    retain_gate_values = self.gate_hook.last_gate_values_train
+                    if retain_gate_values is None:
+                        raise RuntimeError(
+                            "Gate hook did not capture differentiable retain gate values"
+                        )
+                    retain_loss = retain_loss.to(loss_device)
+                    retain_gate_values = retain_gate_values.to(
+                        device=loss_device, dtype=torch.float32
+                    )
+
+                    forget_gate_mean = forget_gate_values.mean()
+                    retain_gate_mean = retain_gate_values.mean()
+                    gate_gap = retain_gate_mean - forget_gate_mean
+                    selectivity_margin = torch.tensor(
+                        self.selectivity_margin,
+                        device=gate_gap.device,
+                        dtype=gate_gap.dtype,
+                    )
+                    selectivity_loss = F.relu(selectivity_margin - gate_gap)
+                    forget_gate_penalty = (forget_gate_values ** 2).mean()
+                    retain_gate_penalty = ((retain_gate_values - 1.0) ** 2).mean()
+
+                    loss = (
+                        forget_loss
+                        + self.lambda_retain * retain_loss
+                        + self.lambda_gate_forget * forget_gate_penalty
+                        + self.lambda_gate_retain * retain_gate_penalty
+                        + self.lambda_selectivity * selectivity_loss
+                    )
+
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.gate.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+
+                    total_forget_loss += forget_loss.item()
+                    total_retain_loss += retain_loss.item()
+                    total_selectivity_loss += selectivity_loss.item()
+                    total_forget_gate_mean += forget_gate_mean.item()
+                    total_retain_gate_mean += retain_gate_mean.item()
+                    total_gate_gap += gate_gap.item()
+                    n_success += 1
+
+                except Exception as e:
+                    n_fail += 1
+                    if not printed_traceback:
+                        traceback.print_exc()
+                        printed_traceback = True
+                    sample_id = (
+                        f"{forget_sample.get('id', '<forget>')} / "
+                        f"{retain_sample.get('id', '<retain>')}"
+                    )
+                    print(f"  Error on pair {sample_id}: {e}")
+                    continue
+
+                pbar.set_postfix({
+                    "f_loss": f"{total_forget_loss / (n_success or 1):.3f}",
+                    "r_loss": f"{total_retain_loss / (n_success or 1):.3f}",
+                    "sel": f"{total_selectivity_loss / (n_success or 1):.3f}",
+                    "gap": f"{total_gate_gap / (n_success or 1):+.3f}",
+                })
+        finally:
+            self.gate_hook.remove()
+
+        return {
+            "epoch": epoch + 1,
+            "avg_forget_loss": total_forget_loss / max(n_success, 1),
+            "avg_retain_loss": total_retain_loss / max(n_success, 1),
+            "avg_selectivity_loss": total_selectivity_loss / max(n_success, 1),
+            "avg_forget_gate_mean": total_forget_gate_mean / max(n_success, 1),
+            "avg_retain_gate_mean": total_retain_gate_mean / max(n_success, 1),
+            "avg_gate_gap": total_gate_gap / max(n_success, 1),
+            "n_steps": n_steps,
+            "n_success": n_success,
+            "n_forget": n_success,
+            "n_retain": n_success,
             "n_fail": n_fail,
         }
 
@@ -780,6 +945,10 @@ def parse_args():
                help="Penalty weight that keeps retain gates close to 1.0")
     p.add_argument("--lambda_gate_forget", type=float, default=0.0,
                help="Penalty weight that pushes forget gates close to 0.0")
+    p.add_argument("--lambda_selectivity", type=float, default=0.0,
+                   help="Weight of paired retain-vs-forget gate selectivity loss")
+    p.add_argument("--selectivity_margin", type=float, default=0.2,
+                   help="Desired retain minus forget mean-gate margin")
     p.add_argument("--gate_init_bias", type=float, default=2.0,
                    help="Initial bias for gate output layer. "
                         "sigmoid(2.0)~0.88, sigmoid(1.0)~0.73, sigmoid(0.0)=0.50. "
@@ -881,6 +1050,8 @@ def main():
         lambda_retain=args.lambda_retain,
         lambda_gate_retain=args.lambda_gate_retain,
         lambda_gate_forget=args.lambda_gate_forget,
+        lambda_selectivity=args.lambda_selectivity,
+        selectivity_margin=args.selectivity_margin,
     )
 
     log = []
@@ -890,6 +1061,8 @@ def main():
         print(f"\n  Epoch {stats['epoch']}: "
               f"forget_loss={stats['avg_forget_loss']:.4f}  "
               f"retain_loss={stats['avg_retain_loss']:.4f}  "
+              f"selectivity_loss={stats['avg_selectivity_loss']:.4f}  "
+              f"gate_gap={stats['avg_gate_gap']:+.4f}  "
               f"failures={stats['n_fail']}")
 
     # -- save --
@@ -928,6 +1101,8 @@ def main():
         "lambda_retain": args.lambda_retain,
         "lambda_gate_retain": args.lambda_gate_retain,
         "lambda_gate_forget": args.lambda_gate_forget,
+        "lambda_selectivity": args.lambda_selectivity,
+        "selectivity_margin": args.selectivity_margin,
         "epochs": args.epochs,
     }
     with open(output_dir / "gate_diagnostics.json", "w") as f:
