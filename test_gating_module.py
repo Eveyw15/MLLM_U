@@ -82,6 +82,18 @@ class GateModuleTests(unittest.TestCase):
         self.assertEqual(args.forget_gate_ceiling, 0.18)
         self.assertEqual(args.retain_gate_floor, 0.35)
 
+    def test_parse_args_accepts_forget_weight(self):
+        argv = [
+            "gating_module.py",
+            "--smoke_test",
+            "--lambda_forget",
+            "0.25",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = gating_module.parse_args()
+
+        self.assertEqual(args.lambda_forget, 0.25)
+
     def run_paired_epoch_with_gate_values(
         self,
         forget_gate,
@@ -210,6 +222,50 @@ class GateModuleTests(unittest.TestCase):
         self.assertGreater(stats["avg_forget_ceiling_loss"], 0.0)
         self.assertGreater(stats["avg_retain_floor_loss"], 0.0)
         self.assertGreater(stats["avg_gate_band_loss"], 0.0)
+
+    def test_lambda_forget_scales_paired_forget_gradient(self):
+        forget_gate = 0.4
+        gate = TinyGate(forget_gate=forget_gate, retain_gate=0.4)
+
+        with patch.object(gating_module, "GateHook", FakeGateHook):
+            trainer = gating_module.GateTrainer(
+                TinyModel(),
+                processor=None,
+                gate=gate,
+                layer=31,
+                channel_indices=[1512],
+                device="cpu",
+                lr=0.0,
+                lambda_forget=0.25,
+                lambda_retain=0.0,
+                lambda_gate_retain=0.0,
+                lambda_gate_forget=0.0,
+                lambda_selectivity=0.0,
+                selectivity_margin=0.0,
+                lambda_gate_band=0.0,
+            )
+
+        def fake_forget_loss(model, processor, sample, device):
+            values = torch.sigmoid(gate.forget_logit).reshape(1, 1)
+            trainer.gate_hook.last_gate_values_train = values
+            return values.mean()
+
+        def fake_retain_loss(model, processor, sample, device):
+            values = torch.sigmoid(gate.retain_logit).reshape(1, 1)
+            trainer.gate_hook.last_gate_values_train = values
+            return values.mean() * 0.0
+
+        with patch.object(gating_module, "compute_forget_loss", fake_forget_loss), \
+             patch.object(gating_module, "compute_retain_loss", fake_retain_loss):
+            stats = trainer.train_epoch_paired(
+                forget_set=[{"id": "f1"}],
+                retain_set=[{"id": "r1"}],
+                epoch=0,
+            )
+
+        expected_grad = 0.25 * forget_gate * (1.0 - forget_gate)
+        self.assertAlmostEqual(gate.forget_logit.grad.item(), expected_grad)
+        self.assertEqual(stats["lambda_forget"], 0.25)
 
 
 if __name__ == "__main__":

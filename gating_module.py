@@ -16,7 +16,7 @@ Architecture (layer 31, k = number of sensitive channels):
     h[:, :, top_k_indices] *= g.unsqueeze(1)   # broadcast over T
 
 Training loss:
-    L = L_forget + lambda_retain * L_retain
+    L = lambda_forget * L_forget + lambda_retain * L_retain
     L_forget = -cross_entropy(target | true_image, gated_model)
     L_retain =  cross_entropy(original_output | image, gated_model)
     Optional paired selectivity:
@@ -371,6 +371,7 @@ class GateTrainer:
                  channel_indices: list[int],
                  device: str,
                  lr: float = 0.01,
+                 lambda_forget: float = 1.0,
                  lambda_retain: float = 1.0,
                  lambda_gate_retain: float = 0.0,
                  lambda_gate_forget: float = 0.0,
@@ -385,6 +386,7 @@ class GateTrainer:
         self.layer = layer
         self.channel_indices = channel_indices
         self.device = device
+        self.lambda_forget = lambda_forget
         self.lambda_retain = lambda_retain
         self.lambda_gate_retain = lambda_gate_retain
         self.lambda_gate_forget = lambda_gate_forget
@@ -440,7 +442,7 @@ class GateTrainer:
                         self.model, self.processor, sample, self.device
                     )
 
-                    loss = task_loss
+                    loss = self.lambda_forget * task_loss
 
                     gate_values = self.gate_hook.last_gate_values_train
                     if gate_values is not None:
@@ -512,6 +514,7 @@ class GateTrainer:
             "avg_gate_gap": avg_retain_gate_mean - avg_forget_gate_mean,
             "forget_gate_ceiling": self.forget_gate_ceiling,
             "retain_gate_floor": self.retain_gate_floor,
+            "lambda_forget": self.lambda_forget,
             "n_forget": n_forget,
             "n_retain": n_retain,
             "n_fail": n_fail,
@@ -608,7 +611,7 @@ class GateTrainer:
                     gate_band_loss = forget_ceiling_loss + retain_floor_loss
 
                     loss = (
-                        forget_loss
+                        self.lambda_forget * forget_loss
                         + self.lambda_retain * retain_loss
                         + self.lambda_gate_forget * forget_gate_penalty
                         + self.lambda_gate_retain * retain_gate_penalty
@@ -666,6 +669,7 @@ class GateTrainer:
             "avg_gate_gap": total_gate_gap / max(n_success, 1),
             "forget_gate_ceiling": self.forget_gate_ceiling,
             "retain_gate_floor": self.retain_gate_floor,
+            "lambda_forget": self.lambda_forget,
             "n_steps": n_steps,
             "n_success": n_success,
             "n_forget": n_success,
@@ -980,6 +984,8 @@ def parse_args():
                    help="Training epochs (default: 5)")
     p.add_argument("--lr", type=float, default=0.01,
                    help="Learning rate (default: 0.01)")
+    p.add_argument("--lambda_forget", type=float, default=1.0,
+                   help="Weight of forget loss (default: 1.0)")
     p.add_argument("--lambda_retain", type=float, default=1.0,
                    help="Weight of retain loss (default: 1.0)")
     p.add_argument("--lambda_gate_retain", type=float, default=0.0,
@@ -1094,6 +1100,7 @@ def main():
         channel_indices=channel_indices,
         device=device,
         lr=args.lr,
+        lambda_forget=args.lambda_forget,
         lambda_retain=args.lambda_retain,
         lambda_gate_retain=args.lambda_gate_retain,
         lambda_gate_forget=args.lambda_gate_forget,
@@ -1149,6 +1156,7 @@ def main():
         "topk": args.topk,
         "gate_init_bias": args.gate_init_bias,
         "lr": args.lr,
+        "lambda_forget": args.lambda_forget,
         "lambda_retain": args.lambda_retain,
         "lambda_gate_retain": args.lambda_gate_retain,
         "lambda_gate_forget": args.lambda_gate_forget,
