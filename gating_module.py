@@ -155,6 +155,7 @@ class GateHook:
         self.capture_gate_values = capture_gate_values
         self.last_gate_values: Optional[torch.Tensor] = None
         self.last_gate_values_train = None
+        self.gate_values_history = []
 
     def _make_hook(self):
         gate = self.gate
@@ -186,7 +187,9 @@ class GateHook:
             hook_self.last_gate_values_train = g
 
             if hook_self.capture_gate_values:
-                hook_self.last_gate_values = g.detach().cpu().float()
+                gate_values = g.detach().cpu().float()
+                hook_self.last_gate_values = gate_values
+                hook_self.gate_values_history.append(gate_values)
 
             # Apply gate (broadcast over token dim)
             h = h.clone()
@@ -199,6 +202,9 @@ class GateHook:
         return hook_fn
 
     def register(self):
+        self.gate_values_history = []
+        self.last_gate_values = None
+        self.last_gate_values_train = None
         from analyze_channels import get_language_layers
         layers = get_language_layers(self.model)
         self._handle = layers[self.layer_idx].register_forward_hook(self._make_hook())
@@ -214,6 +220,35 @@ class GateHook:
 
     def __exit__(self, *args):
         self.remove()
+
+
+def summarize_gate_history(gate_values_history: list[torch.Tensor]) -> dict:
+    """Summarize captured gate values across generation forwards."""
+    if not gate_values_history:
+        nan = float("nan")
+        return {
+            "gate_values": [],
+            "first_gate_values": [],
+            "last_gate_values": [],
+            "gate_mean": nan,
+            "first_gate_mean": nan,
+            "last_gate_mean": nan,
+            "n_gate_forwards": 0,
+        }
+
+    first_gate_values = gate_values_history[0].squeeze(0)
+    last_gate_values = gate_values_history[-1].squeeze(0)
+    mean_gate_values = torch.stack(gate_values_history, dim=0).mean(dim=0).squeeze(0)
+
+    return {
+        "gate_values": mean_gate_values.tolist(),
+        "first_gate_values": first_gate_values.tolist(),
+        "last_gate_values": last_gate_values.tolist(),
+        "gate_mean": mean_gate_values.mean().item(),
+        "first_gate_mean": first_gate_values.mean().item(),
+        "last_gate_mean": last_gate_values.mean().item(),
+        "n_gate_forwards": len(gate_values_history),
+    }
 
 
 # =========================================================================
@@ -719,15 +754,11 @@ class GateTrainer:
                 else:
                     flip_type = "unchanged"
 
-                # Gate values from the last forward pass during generate
-                gate_vec = diag_hook.last_gate_values
-                if gate_vec is not None:
-                    gate_vec = gate_vec.squeeze(0)  # [k]
-                    gate_list = gate_vec.tolist()
-                    gate_mean = gate_vec.mean().item()
-                else:
-                    gate_list = []
-                    gate_mean = float("nan")
+                # Gate diagnostics across all forward passes during generate.
+                gate_values_history = diag_hook.gate_values_history
+                if not gate_values_history and diag_hook.last_gate_values is not None:
+                    gate_values_history = [diag_hook.last_gate_values]
+                gate_summary = summarize_gate_history(gate_values_history)
 
                 results[split_name].append({
                     "id": sample["id"],
@@ -737,8 +768,7 @@ class GateTrainer:
                     "ungated_answer": ungated_answer,
                     "gated_answer": gated_answer,
                     "flip_type": flip_type,
-                    "gate_values": gate_list,
-                    "gate_mean": gate_mean,
+                    **gate_summary,
                 })
 
         def rate(records, key):
@@ -805,6 +835,19 @@ class GateTrainer:
                         "id": r["id"],
                         "gate_mean": round(r["gate_mean"], 4),
                         "gate_values": [round(v, 4) for v in r["gate_values"]],
+                        "first_gate_mean": round(
+                            r.get("first_gate_mean", float("nan")), 4
+                        ),
+                        "first_gate_values": [
+                            round(v, 4) for v in r.get("first_gate_values", [])
+                        ],
+                        "last_gate_mean": round(
+                            r.get("last_gate_mean", float("nan")), 4
+                        ),
+                        "last_gate_values": [
+                            round(v, 4) for v in r.get("last_gate_values", [])
+                        ],
+                        "n_gate_forwards": r.get("n_gate_forwards", 0),
                         "flip_type": r["flip_type"],
                         "ungated_answer": r["ungated_answer"],
                         "gated_answer": r["gated_answer"],

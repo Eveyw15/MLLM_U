@@ -267,6 +267,25 @@ class GateModuleTests(unittest.TestCase):
         self.assertAlmostEqual(gate.forget_logit.grad.item(), expected_grad)
         self.assertEqual(stats["lambda_forget"], 0.25)
 
+    def test_gate_history_summary_uses_mean_as_main_gate_values(self):
+        history = [
+            torch.tensor([[0.1, 0.3]]),
+            torch.tensor([[0.5, 0.7]]),
+        ]
+
+        summary = gating_module.summarize_gate_history(history)
+
+        for actual, expected in zip(summary["gate_values"], [0.3, 0.5]):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(summary["first_gate_values"], [0.1, 0.3]):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(summary["last_gate_values"], [0.5, 0.7]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertAlmostEqual(summary["gate_mean"], 0.4)
+        self.assertAlmostEqual(summary["first_gate_mean"], 0.2)
+        self.assertAlmostEqual(summary["last_gate_mean"], 0.6)
+        self.assertEqual(summary["n_gate_forwards"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
