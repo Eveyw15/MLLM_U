@@ -11,7 +11,7 @@ forget-like inputs while staying open on retain-like inputs.
 Architecture (layer 31, k = number of sensitive channels):
 
     h_k = h[:, :, top_k_indices]              # [B, T, k]
-    x   = pool_fn(h_k)                        # [B, k]  (mean of abs values)
+    x   = pool_fn(h_k)                        # [B, k] or [B, 4k]
     g   = sigmoid(W2 * ReLU(W1 * x + b1) + b2)  # [B, k]
     h[:, :, top_k_indices] *= g.unsqueeze(1)   # broadcast over T
 
@@ -68,6 +68,53 @@ def pool_abs_mean(h_k: torch.Tensor) -> torch.Tensor:
     return h_k.abs().mean(dim=1)
 
 
+def pool_rich_stats(h_k: torch.Tensor) -> torch.Tensor:
+    """
+    Pool selected channel activations using multiple statistics.
+
+    Args:
+        h_k: [B, T, k]
+
+    Returns:
+        [B, 4k] concatenating:
+        - abs_mean: h_k.abs().mean(dim=1)
+        - signed_mean: h_k.mean(dim=1)
+        - std: h_k.float().std(dim=1, unbiased=False)
+        - max_abs: h_k.abs().amax(dim=1)
+    """
+    h_float = h_k.float()
+    abs_h = h_float.abs()
+    abs_mean = abs_h.mean(dim=1)
+    signed_mean = h_float.mean(dim=1)
+    std = h_float.std(dim=1, unbiased=False)
+    max_abs = abs_h.amax(dim=1)
+    return torch.cat([abs_mean, signed_mean, std, max_abs], dim=-1)
+
+
+def pooling_config(pooling_mode: str):
+    """Return (pool_fn, input_multiplier) for a named pooling mode."""
+    if pooling_mode == "abs_mean":
+        return pool_abs_mean, 1
+    if pooling_mode == "rich":
+        return pool_rich_stats, 4
+    raise ValueError(f"Unknown pooling_mode: {pooling_mode}")
+
+
+def infer_pooling_mode(pool_fn) -> str:
+    """Best-effort label for checkpoint metadata."""
+    if pool_fn is pool_abs_mean:
+        return "abs_mean"
+    if pool_fn is pool_rich_stats:
+        return "rich"
+
+    name = getattr(pool_fn, "__name__", "")
+    if name == "pool_abs_mean":
+        return "abs_mean"
+    if name == "pool_rich_stats":
+        return "rich"
+    return name or "custom"
+
+
 # =========================================================================
 #  2. Input-conditioned gate module
 # =========================================================================
@@ -77,7 +124,7 @@ class InputConditionedGate(nn.Module):
     Lightweight MLP that predicts a per-sample gate vector from pooled
     activation statistics of the top-k sensitive channels.
 
-    Input:  pooled abs activations [B, k]
+    Input:  pooled activations [B, input_dim]
     Output: gate values in [0, 1]  [B, k]
 
     Conservative initialization: final bias set so that sigmoid output
@@ -86,20 +133,27 @@ class InputConditionedGate(nn.Module):
     """
 
     def __init__(self, k: int, final_bias_init: float = 2.0,
-                 pool_fn=pool_abs_mean):
+                 pool_fn=pool_abs_mean, input_multiplier: int = 1,
+                 hidden_dim: Optional[int] = None):
         """
         Args:
             k: number of sensitive channels (gate input/output width)
             final_bias_init: initial value for the output bias.
                 sigmoid(2.0) ~ 0.88, sigmoid(2.5) ~ 0.92.
-            pool_fn: callable [B, T, k] -> [B, k]
+            pool_fn: callable [B, T, k] -> [B, input_dim]
+            input_multiplier: multiplier such that input_dim = k * input_multiplier.
+            hidden_dim: optional hidden width. Defaults to max(k, input_dim).
         """
         super().__init__()
         self.k = k
         self.pool_fn = pool_fn
+        self.input_multiplier = input_multiplier
+        self.input_dim = k * input_multiplier
+        self.hidden_dim = hidden_dim or max(k, self.input_dim)
+        self.pooling_mode = infer_pooling_mode(pool_fn)
 
-        self.fc1 = nn.Linear(k, k)
-        self.fc2 = nn.Linear(k, k)
+        self.fc1 = nn.Linear(self.input_dim, self.hidden_dim)
+        self.fc2 = nn.Linear(self.hidden_dim, k)
 
         # Conservative init: small weights, bias set for mostly-open output
         nn.init.xavier_uniform_(self.fc1.weight, gain=0.1)
@@ -115,8 +169,8 @@ class InputConditionedGate(nn.Module):
             gate: [B, k] values in [0, 1]
         """
         orig_dtype = h_k.dtype
-        x = self.pool_fn(h_k).to(torch.float32)  # [B, k]
-        x = F.relu(self.fc1(x))     # [B, k]
+        x = self.pool_fn(h_k).to(torch.float32)  # [B, input_dim]
+        x = F.relu(self.fc1(x))     # [B, hidden_dim]
         x = self.fc2(x)             # [B, k]
         return torch.sigmoid(x).to(orig_dtype)  # [B, k]
 
@@ -898,18 +952,44 @@ class GateTrainer:
             "layer": self.layer,
             "channel_indices": self.channel_indices,
             "k": self.gate.k,
+            "pooling_mode": getattr(self.gate, "pooling_mode", "abs_mean"),
+            "input_multiplier": getattr(self.gate, "input_multiplier", 1),
+            "input_dim": getattr(self.gate, "input_dim", self.gate.k),
+            "hidden_dim": getattr(self.gate, "hidden_dim", self.gate.k),
         }, output_dir / "gate_weights.pt")
         print(f"Gate saved to: {output_dir / 'gate_weights.pt'}")
 
     @staticmethod
     def load_gate(path: Path, device: str = "cpu",
-                  pool_fn=pool_abs_mean) -> tuple:
+                  pool_fn=None) -> tuple:
         """
         Load a trained gate from disk.
         Returns (gate, layer, channel_indices).
         """
         ckpt = torch.load(path, map_location=device, weights_only=True)
-        gate = InputConditionedGate(k=ckpt["k"], pool_fn=pool_fn)
+        pooling_mode = ckpt.get("pooling_mode", "abs_mean")
+        if pool_fn is None:
+            pool_fn, mode_input_multiplier = pooling_config(pooling_mode)
+        else:
+            inferred_mode = infer_pooling_mode(pool_fn)
+            if inferred_mode in {"abs_mean", "rich"}:
+                _, mode_input_multiplier = pooling_config(inferred_mode)
+            else:
+                mode_input_multiplier = 1
+
+        default_input_multiplier = mode_input_multiplier if "pooling_mode" in ckpt else 1
+        input_multiplier = ckpt.get("input_multiplier", default_input_multiplier)
+        state_dict = ckpt["state_dict"]
+        hidden_dim = ckpt.get("hidden_dim")
+        if hidden_dim is None and "fc1.weight" in state_dict:
+            hidden_dim = state_dict["fc1.weight"].shape[0]
+
+        gate = InputConditionedGate(
+            k=ckpt["k"],
+            pool_fn=pool_fn,
+            input_multiplier=int(input_multiplier),
+            hidden_dim=int(hidden_dim) if hidden_dim is not None else None,
+        )
         gate.load_state_dict(ckpt["state_dict"])
         gate = gate.to(device)
         return gate, ckpt["layer"], ckpt["channel_indices"]
@@ -967,6 +1047,23 @@ def smoke_test():
         f"Pooling mismatch: {pooled} vs {expected}"
     )
     print("[PASS] pool_abs_mean correct")
+
+    rich_pooled = pool_rich_stats(h_k)
+    assert rich_pooled.shape == (B, 4 * k), (
+        f"Expected rich stats shape ({B}, {4 * k}), got {rich_pooled.shape}"
+    )
+    print(f"[PASS] pool_rich_stats shape: {rich_pooled.shape}")
+
+    rich_gate = InputConditionedGate(
+        k=k,
+        pool_fn=pool_rich_stats,
+        input_multiplier=4,
+    )
+    rich_g = rich_gate(h_k)
+    assert rich_g.shape == (B, k), (
+        f"Expected rich gate shape ({B}, {k}), got {rich_g.shape}"
+    )
+    print(f"[PASS] Rich InputConditionedGate output shape: {rich_g.shape}")
 
     # ---- 5. Hook simulation ----
     h_before = torch.randn(1, T, H)
@@ -1049,6 +1146,8 @@ def parse_args():
                    help="Initial bias for gate output layer. "
                         "sigmoid(2.0)~0.88, sigmoid(1.0)~0.73, sigmoid(0.0)=0.50. "
                         "Lower = more aggressive initial suppression (default: 2.0)")
+    p.add_argument("--pooling_mode", choices=["abs_mean", "rich"], default="abs_mean",
+                   help="Pooling features for the gate input (default: abs_mean)")
     p.add_argument("--model_id", default="llava-hf/llava-1.5-7b-hf")
     p.add_argument("--no_quantize", action="store_true",
                    help="Disable 8-bit quantization")
@@ -1058,16 +1157,16 @@ def parse_args():
 
 
 def main():
-    from transformers import BitsAndBytesConfig, LlavaForConditionalGeneration
-    from analyze_channels import get_language_layers
-    from minimal_eval_unlok import load_processor
-    from suppression import load_top_channels
-
     args = parse_args()
 
     if args.smoke_test:
         smoke_test()
         return 0
+
+    from transformers import BitsAndBytesConfig, LlavaForConditionalGeneration
+    from analyze_channels import get_language_layers
+    from minimal_eval_unlok import load_processor
+    from suppression import load_top_channels
 
     # Validate required training arguments now that smoke_test is ruled out
     missing = [
@@ -1126,7 +1225,21 @@ def main():
 
     # -- create gate --
     k = len(channel_indices)
-    gate = InputConditionedGate(k=k, final_bias_init=args.gate_init_bias)
+    if args.pooling_mode == "abs_mean":
+        pool_fn = pool_abs_mean
+        input_multiplier = 1
+    elif args.pooling_mode == "rich":
+        pool_fn = pool_rich_stats
+        input_multiplier = 4
+    else:
+        raise ValueError(f"Unknown pooling_mode: {args.pooling_mode}")
+
+    gate = InputConditionedGate(
+        k=k,
+        final_bias_init=args.gate_init_bias,
+        pool_fn=pool_fn,
+        input_multiplier=input_multiplier,
+    )
 
     # Move gate to same device as the target layer
     layers = get_language_layers(model)
@@ -1134,7 +1247,9 @@ def main():
     gate = gate.to(device=layer_device, dtype=torch.float32)
 
     n_params = sum(p.numel() for p in gate.parameters())
-    print(f"Gate created: k={k}, {n_params} trainable parameters")
+    print(f"Gate created: k={k}, pooling={args.pooling_mode}, "
+          f"input_dim={gate.input_dim}, hidden_dim={gate.hidden_dim}, "
+          f"{n_params} trainable parameters")
 
     # -- train --
     trainer = GateTrainer(
@@ -1198,6 +1313,8 @@ def main():
         "layer": args.layer,
         "topk": args.topk,
         "gate_init_bias": args.gate_init_bias,
+        "pooling_mode": args.pooling_mode,
+        "input_multiplier": input_multiplier,
         "lr": args.lr,
         "lambda_forget": args.lambda_forget,
         "lambda_retain": args.lambda_retain,
