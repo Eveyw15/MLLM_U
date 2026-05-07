@@ -11,8 +11,8 @@ the detector leak score controls a scalar suppression gate for those channels:
     scalar_gate = alpha_retain + leak_score * (alpha_forget - alpha_retain)
     h[:, :, top_k_channels] *= scalar_gate
 
-The LLaVA model is frozen. Only detector parameters are trained with
-BCEWithLogitsLoss.
+The LLaVA model is frozen. Only detector parameters are trained with paired
+BCEWithLogitsLoss plus an optional leak-score separation loss.
 """
 
 import argparse
@@ -57,7 +57,7 @@ def compute_scalar_gate(leak_score: torch.Tensor,
 
 
 class LeakDetector(nn.Module):
-    """Small MLP leak detector over rich pooled top-k channel statistics."""
+    """Small MLP leak detector over normalized rich top-k channel statistics."""
 
     def __init__(self, k: int, hidden_dim: int = 16):
         super().__init__()
@@ -65,6 +65,7 @@ class LeakDetector(nn.Module):
         self.input_dim = 4 * k
         self.hidden_dim = hidden_dim
 
+        self.norm = nn.LayerNorm(self.input_dim)
         self.fc1 = nn.Linear(self.input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, 1)
 
@@ -80,7 +81,7 @@ class LeakDetector(nn.Module):
         Returns:
             logits: [B, 1]
         """
-        x = features.to(torch.float32)
+        x = self.norm(features.to(torch.float32))
         x = F.relu(self.fc1(x))
         return self.fc2(x)
 
@@ -232,6 +233,8 @@ class DGUTrainer:
                  channel_indices: list[int],
                  device: str,
                  lr: float = 0.001,
+                 lambda_sep: float = 1.0,
+                 score_margin: float = 0.3,
                  alpha_forget: float = 0.0,
                  alpha_retain: float = 1.0):
         self.model = model
@@ -240,6 +243,8 @@ class DGUTrainer:
         self.layer = layer
         self.channel_indices = channel_indices
         self.device = device
+        self.lambda_sep = lambda_sep
+        self.score_margin = score_margin
         self.alpha_forget = alpha_forget
         self.alpha_retain = alpha_retain
 
@@ -271,102 +276,136 @@ class DGUTrainer:
             del inputs["labels"]
         return inputs
 
+    def run_detector_forward(self, sample: dict, label: int) -> torch.Tensor:
+        """Run one sample through the frozen model and return detector logits."""
+        self.hook.reset_train_values()
+        inputs = self.build_training_inputs(sample, label)
+        outputs = self.model(**inputs)
+        del outputs
+
+        logits = self.hook.last_detector_logits_train
+        if logits is None:
+            raise RuntimeError("Detector hook did not capture logits")
+        return logits.float()
+
     def train_epoch(self, forget_set: list[dict],
                     retain_set: list[dict],
                     epoch: int) -> dict:
-        """Run one detector-training epoch."""
+        """Run one balanced paired detector-training epoch."""
         self.model.eval()
         self.detector.train()
         self.hook.capture_values = False
         self.hook.register()
 
-        all_samples = (
-            [(s, 1, "forget") for s in forget_set] +
-            [(s, 0, "retain") for s in retain_set]
-        )
-        random.shuffle(all_samples)
-
+        n_steps = max(len(forget_set), len(retain_set))
+        total_bce_loss = 0.0
+        total_sep_loss = 0.0
         total_loss = 0.0
-        split_loss = {"forget": 0.0, "retain": 0.0}
-        split_count = {"forget": 0, "retain": 0}
-        split_score = {"forget": 0.0, "retain": 0.0}
-        split_gate = {"forget": 0.0, "retain": 0.0}
+        total_forget_score = 0.0
+        total_retain_score = 0.0
+        total_score_gap = 0.0
+        total_forget_gate = 0.0
+        total_retain_gate = 0.0
+        n_success = 0
         n_fail = 0
         printed_traceback = False
 
         try:
-            pbar = tqdm(all_samples, desc=f"Epoch {epoch + 1}")
-            for sample, label, split_name in pbar:
+            pbar = tqdm(range(n_steps), desc=f"Epoch {epoch + 1}")
+            for _ in pbar:
+                forget_sample = random.choice(forget_set)
+                retain_sample = random.choice(retain_set)
                 self.optimizer.zero_grad(set_to_none=True)
-                self.hook.reset_train_values()
 
                 try:
-                    inputs = self.build_training_inputs(sample, label)
-                    outputs = self.model(**inputs)
-                    del outputs
+                    forget_logits = self.run_detector_forward(forget_sample, label=1)
+                    retain_logits = self.run_detector_forward(retain_sample, label=0)
 
-                    logits = self.hook.last_detector_logits_train
-                    if logits is None:
-                        raise RuntimeError("Detector hook did not capture logits")
+                    forget_labels = torch.ones_like(forget_logits)
+                    retain_labels = torch.zeros_like(retain_logits)
+                    forget_bce = self.criterion(forget_logits, forget_labels)
+                    retain_bce = self.criterion(retain_logits, retain_labels)
+                    bce_loss = 0.5 * (forget_bce + retain_bce)
 
-                    labels = torch.full_like(logits.float(), float(label))
-                    loss = self.criterion(logits.float(), labels)
+                    forget_score = torch.sigmoid(forget_logits)
+                    retain_score = torch.sigmoid(retain_logits)
+                    score_gap = forget_score.mean() - retain_score.mean()
+                    sep_loss = F.relu(
+                        forget_logits.new_tensor(self.score_margin) - score_gap
+                    )
+
+                    loss = bce_loss + self.lambda_sep * sep_loss
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.detector.parameters(), 1.0)
                     self.optimizer.step()
 
                     with torch.no_grad():
-                        leak_score = torch.sigmoid(logits.float()).mean().item()
-                        scalar_gate = compute_scalar_gate(
-                            torch.sigmoid(logits.float()),
+                        forget_score_val = forget_score.mean().item()
+                        retain_score_val = retain_score.mean().item()
+                        score_gap_val = forget_score_val - retain_score_val
+                        forget_gate = compute_scalar_gate(
+                            forget_score,
+                            self.alpha_forget,
+                            self.alpha_retain,
+                        ).mean().item()
+                        retain_gate = compute_scalar_gate(
+                            retain_score,
                             self.alpha_forget,
                             self.alpha_retain,
                         ).mean().item()
 
-                    loss_val = loss.item()
-                    total_loss += loss_val
-                    split_loss[split_name] += loss_val
-                    split_score[split_name] += leak_score
-                    split_gate[split_name] += scalar_gate
-                    split_count[split_name] += 1
+                    total_bce_loss += bce_loss.item()
+                    total_sep_loss += sep_loss.item()
+                    total_loss += loss.item()
+                    total_forget_score += forget_score_val
+                    total_retain_score += retain_score_val
+                    total_score_gap += score_gap_val
+                    total_forget_gate += forget_gate
+                    total_retain_gate += retain_gate
+                    n_success += 1
 
                 except Exception as e:
                     n_fail += 1
                     if not printed_traceback:
                         traceback.print_exc()
                         printed_traceback = True
-                    print(f"  Error on {sample.get('id', '<unknown>')}: {e}")
+                    print(f"  Error on pair: {e}")
                     continue
 
-                n_done = split_count["forget"] + split_count["retain"]
                 pbar.set_postfix({
-                    "loss": f"{total_loss / max(n_done, 1):.3f}",
-                    "f_score": f"{split_score['forget'] / max(split_count['forget'], 1):.3f}",
-                    "r_score": f"{split_score['retain'] / max(split_count['retain'], 1):.3f}",
+                    "bce": f"{total_bce_loss / max(n_success, 1):.3f}",
+                    "sep": f"{total_sep_loss / max(n_success, 1):.3f}",
+                    "gap": f"{total_score_gap / max(n_success, 1):+.3f}",
                 })
         finally:
             self.hook.remove()
 
-        n_success = split_count["forget"] + split_count["retain"]
-        forget_score = split_score["forget"] / max(split_count["forget"], 1)
-        retain_score = split_score["retain"] / max(split_count["retain"], 1)
-        forget_gate = split_gate["forget"] / max(split_count["forget"], 1)
-        retain_gate = split_gate["retain"] / max(split_count["retain"], 1)
+        avg_forget_score = total_forget_score / max(n_success, 1)
+        avg_retain_score = total_retain_score / max(n_success, 1)
+        avg_score_gap = total_score_gap / max(n_success, 1)
+        avg_forget_gate = total_forget_gate / max(n_success, 1)
+        avg_retain_gate = total_retain_gate / max(n_success, 1)
 
         return {
             "epoch": epoch + 1,
-            "avg_bce_loss": total_loss / max(n_success, 1),
-            "avg_forget_bce_loss": split_loss["forget"] / max(split_count["forget"], 1),
-            "avg_retain_bce_loss": split_loss["retain"] / max(split_count["retain"], 1),
-            "avg_forget_leak_score": forget_score,
-            "avg_retain_leak_score": retain_score,
-            "forget_minus_retain_leak_score_gap": forget_score - retain_score,
-            "retain_minus_forget_leak_score_gap": retain_score - forget_score,
-            "avg_forget_scalar_gate": forget_gate,
-            "avg_retain_scalar_gate": retain_gate,
+            "avg_loss": total_loss / max(n_success, 1),
+            "avg_bce_loss": total_bce_loss / max(n_success, 1),
+            "avg_sep_loss": total_sep_loss / max(n_success, 1),
+            "avg_forget_score": avg_forget_score,
+            "avg_retain_score": avg_retain_score,
+            "avg_score_gap": avg_score_gap,
+            "avg_forget_leak_score": avg_forget_score,
+            "avg_retain_leak_score": avg_retain_score,
+            "forget_minus_retain_leak_score_gap": avg_score_gap,
+            "retain_minus_forget_leak_score_gap": -avg_score_gap,
+            "avg_forget_scalar_gate": avg_forget_gate,
+            "avg_retain_scalar_gate": avg_retain_gate,
+            "lambda_sep": self.lambda_sep,
+            "score_margin": self.score_margin,
+            "n_steps": n_steps,
             "n_success": n_success,
-            "n_forget": split_count["forget"],
-            "n_retain": split_count["retain"],
+            "n_forget": n_success,
+            "n_retain": n_success,
             "n_fail": n_fail,
         }
 
@@ -541,6 +580,8 @@ class DGUTrainer:
             "pooling_mode": "rich",
             "alpha_forget": self.alpha_forget,
             "alpha_retain": self.alpha_retain,
+            "lambda_sep": self.lambda_sep,
+            "score_margin": self.score_margin,
         }, output_dir / "detector_weights.pt")
         print(f"Detector saved to: {output_dir / 'detector_weights.pt'}")
 
@@ -561,9 +602,9 @@ def print_eval_summary(eval_results: dict):
     print(f"  Mean leak_score:        {eval_results['retain_mean_leak_score']:.4f}")
     print(f"  Mean scalar_gate:       {eval_results['retain_mean_scalar_gate']:.4f}")
 
-    gap = eval_results["retain_minus_forget_leak_score_gap"]
-    print(f"\nretain - forget leak_score gap: {gap:+.4f}")
-    print("desired: negative gap, because forget leak_score should exceed retain")
+    gap = eval_results["forget_minus_retain_leak_score_gap"]
+    print(f"\nscore gap (forget - retain leak_score): {gap:+.4f}")
+    print("desired: positive gap, because forget leak_score should exceed retain")
 
 
 def smoke_test():
@@ -638,6 +679,10 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--lr", type=float, default=0.001)
     p.add_argument("--hidden_dim", type=int, default=16)
+    p.add_argument("--lambda_sep", type=float, default=1.0,
+                   help="Weight for paired leak-score separation loss")
+    p.add_argument("--score_margin", type=float, default=0.3,
+                   help="Desired forget minus retain leak-score margin")
     p.add_argument("--alpha_forget", type=float, default=0.0)
     p.add_argument("--alpha_retain", type=float, default=1.0)
     p.add_argument("--no_quantize", action="store_true",
@@ -729,6 +774,8 @@ def main():
         channel_indices=channel_indices,
         device=device,
         lr=args.lr,
+        lambda_sep=args.lambda_sep,
+        score_margin=args.score_margin,
         alpha_forget=args.alpha_forget,
         alpha_retain=args.alpha_retain,
     )
@@ -739,9 +786,10 @@ def main():
         log.append(stats)
         print(f"\n  Epoch {stats['epoch']}: "
               f"bce={stats['avg_bce_loss']:.4f}  "
-              f"forget_score={stats['avg_forget_leak_score']:.4f}  "
-              f"retain_score={stats['avg_retain_leak_score']:.4f}  "
-              f"retain-forget={stats['retain_minus_forget_leak_score_gap']:+.4f}  "
+              f"sep={stats['avg_sep_loss']:.4f}  "
+              f"forget_score={stats['avg_forget_score']:.4f}  "
+              f"retain_score={stats['avg_retain_score']:.4f}  "
+              f"score_gap={stats['avg_score_gap']:+.4f}  "
               f"failures={stats['n_fail']}")
 
     trainer.save(output_dir)
@@ -767,6 +815,8 @@ def main():
         "epochs": args.epochs,
         "lr": args.lr,
         "hidden_dim": args.hidden_dim,
+        "lambda_sep": args.lambda_sep,
+        "score_margin": args.score_margin,
         "alpha_forget": args.alpha_forget,
         "alpha_retain": args.alpha_retain,
         "pooling_mode": "rich",
