@@ -48,10 +48,23 @@ def compute_scalar_gate(leak_score: torch.Tensor,
                         alpha_forget: float,
                         alpha_retain: float) -> torch.Tensor:
     """
-    Convert detector leak scores into scalar channel gates.
+    Convert detector leak scores into continuous scalar channel gates.
 
     leak_score=1 maps to alpha_forget.
     leak_score=0 maps to alpha_retain.
+    """
+    return alpha_retain + leak_score * (alpha_forget - alpha_retain)
+
+
+def compute_thresholded_scalar_gate(leak_score: torch.Tensor,
+                                    alpha_forget: float,
+                                    alpha_retain: float,
+                                    score_threshold: float) -> torch.Tensor:
+    """
+    Convert detector leak scores into hard thresholded scalar gates.
+
+    If leak_score >= score_threshold, use alpha_forget.
+    Otherwise, use alpha_retain.
     """
     hard_leak = (leak_score >= score_threshold).to(leak_score.dtype)
     return alpha_retain + hard_leak * (alpha_forget - alpha_retain)
@@ -121,7 +134,8 @@ class DGUHook:
              capture_values: bool = False,
              freeze_gate_after_first: bool = True,
              suppression_mode: str = "continuous",
-             score_threshold: float = 0.5):
+             score_threshold: float = 0.5,
+             apply_suppression: bool = True):
         self.model = model
         self.detector = detector
         self.layer_idx = layer
