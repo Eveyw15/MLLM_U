@@ -53,7 +53,8 @@ def compute_scalar_gate(leak_score: torch.Tensor,
     leak_score=1 maps to alpha_forget.
     leak_score=0 maps to alpha_retain.
     """
-    return alpha_retain + leak_score * (alpha_forget - alpha_retain)
+    hard_leak = (leak_score >= score_threshold).to(leak_score.dtype)
+    return alpha_retain + hard_leak * (alpha_forget - alpha_retain)
 
 
 def build_prompt_only_inputs(processor, image, question: str, device: str):
@@ -114,12 +115,13 @@ class DGUHook:
     """
 
     def __init__(self, model, detector: LeakDetector,
-                 layer: int, channel_indices: list[int],
-                 alpha_forget: float = 0.0,
-                 alpha_retain: float = 1.0,
-                 capture_values: bool = False,
-                 freeze_gate_after_first: bool = True,
-                 apply_suppression: bool = True):
+             layer: int, channel_indices: list[int],
+             alpha_forget: float = 0.0,
+             alpha_retain: float = 1.0,
+             capture_values: bool = False,
+             freeze_gate_after_first: bool = True,
+             suppression_mode: str = "continuous",
+             score_threshold: float = 0.5):
         self.model = model
         self.detector = detector
         self.layer_idx = layer
@@ -128,6 +130,8 @@ class DGUHook:
         self.alpha_retain = alpha_retain
         self.capture_values = capture_values
         self.freeze_gate_after_first = freeze_gate_after_first
+        self.suppression_mode = suppression_mode
+        self.score_threshold = score_threshold
         self.apply_suppression = apply_suppression
 
         self._handle = None
@@ -178,9 +182,22 @@ class DGUHook:
                 logits = detector(features)
                 hook_self.n_detector_forwards += 1
                 leak_score = torch.sigmoid(logits)
-                scalar_gate = compute_scalar_gate(
-                    leak_score, hook_self.alpha_forget, hook_self.alpha_retain
-                )
+
+                if hook_self.suppression_mode == "continuous":
+                    scalar_gate = compute_scalar_gate(
+                        leak_score,
+                        hook_self.alpha_forget,
+                        hook_self.alpha_retain,
+                    )
+                elif hook_self.suppression_mode == "threshold":
+                    scalar_gate = compute_thresholded_scalar_gate(
+                        leak_score,
+                        hook_self.alpha_forget,
+                        hook_self.alpha_retain,
+                        hook_self.score_threshold,
+                    )
+                else:
+                    raise ValueError(f"Unknown suppression_mode: {hook_self.suppression_mode}")
 
                 hook_self.last_detector_logits_train = logits
                 if hook_self.freeze_gate_after_first:
@@ -283,16 +300,18 @@ class DGUTrainer:
     """Train, evaluate, and save a detector-guided suppression model."""
 
     def __init__(self, model, processor,
-                 detector: LeakDetector,
-                 layer: int,
-                 channel_indices: list[int],
-                 device: str,
-                 lr: float = 0.001,
-                 lambda_sep: float = 1.0,
-                 score_margin: float = 0.3,
-                 alpha_forget: float = 0.0,
-                 alpha_retain: float = 1.0,
-                 freeze_gate_after_first: bool = True):
+             detector: LeakDetector,
+             layer: int,
+             channel_indices: list[int],
+             device: str,
+             lr: float = 0.001,
+             lambda_sep: float = 1.0,
+             score_margin: float = 0.3,
+             alpha_forget: float = 0.0,
+             alpha_retain: float = 1.0,
+             freeze_gate_after_first: bool = True,
+             suppression_mode: str = "continuous",
+             score_threshold: float = 0.5):
         self.model = model
         self.processor = processor
         self.detector = detector
@@ -304,6 +323,8 @@ class DGUTrainer:
         self.alpha_forget = alpha_forget
         self.alpha_retain = alpha_retain
         self.freeze_gate_after_first = freeze_gate_after_first
+        self.suppression_mode = suppression_mode
+        self.score_threshold = score_threshold
 
         for p in model.parameters():
             p.requires_grad = False
@@ -318,6 +339,8 @@ class DGUTrainer:
             alpha_forget=alpha_forget,
             alpha_retain=alpha_retain,
             freeze_gate_after_first=False,
+            suppression_mode="continuous",
+            score_threshold=score_threshold,
             apply_suppression=False,
         )
 
@@ -492,6 +515,8 @@ class DGUTrainer:
                     alpha_retain=self.alpha_retain,
                     capture_values=True,
                     freeze_gate_after_first=self.freeze_gate_after_first,
+                    suppression_mode=self.suppression_mode,
+                    score_threshold=self.score_threshold,
                     apply_suppression=True,
                 )
                 with diag_hook:
@@ -580,8 +605,8 @@ class DGUTrainer:
             "alpha_forget": self.alpha_forget,
             "alpha_retain": self.alpha_retain,
             "freeze_gate_after_first": self.freeze_gate_after_first,
-            "training_hook_applies_suppression": False,
-            "eval_hook_applies_suppression": True,
+            "suppression_mode": self.suppression_mode,
+            "score_threshold": self.score_threshold,
             "splits": {},
         }
 
@@ -650,6 +675,8 @@ class DGUTrainer:
             "freeze_gate_after_first": self.freeze_gate_after_first,
             "training_hook_applies_suppression": False,
             "eval_hook_applies_suppression": True,
+            "suppression_mode": self.suppression_mode,
+            "score_threshold": self.score_threshold,
             "training_mode": "prompt_only",
         }, output_dir / "detector_weights.pt")
         print(f"Detector saved to: {output_dir / 'detector_weights.pt'}")
@@ -754,6 +781,12 @@ def parse_args():
                    help="Desired forget minus retain leak-score margin")
     p.add_argument("--alpha_forget", type=float, default=0.0)
     p.add_argument("--alpha_retain", type=float, default=1.0)
+    p.add_argument("--suppression_mode",
+                choices=["continuous", "threshold"],
+                default="continuous",
+                help="How leak_score is converted into scalar gate")
+    p.add_argument("--score_threshold", type=float, default=0.5,
+                help="Threshold for hard DGU suppression when suppression_mode=threshold")
     p.add_argument("--no_freeze_gate_after_first", action="store_true",
                    help="Recompute DGU gate on every generation forward")
     p.add_argument("--no_quantize", action="store_true",
@@ -840,6 +873,9 @@ def main():
     print(f"Alpha rule: forget={args.alpha_forget}, retain={args.alpha_retain}")
     freeze_gate_after_first = not args.no_freeze_gate_after_first
     print(f"Freeze gate after first generation forward: {freeze_gate_after_first}")
+    print(f"Suppression mode: {args.suppression_mode}")
+    if args.suppression_mode == "threshold":
+        print(f"Score threshold: {args.score_threshold}")
 
     trainer = DGUTrainer(
         model, processor, detector,
@@ -852,6 +888,8 @@ def main():
         alpha_forget=args.alpha_forget,
         alpha_retain=args.alpha_retain,
         freeze_gate_after_first=freeze_gate_after_first,
+        suppression_mode=args.suppression_mode,
+        score_threshold=args.score_threshold,
     )
 
     log = []
@@ -894,6 +932,8 @@ def main():
         "alpha_forget": args.alpha_forget,
         "alpha_retain": args.alpha_retain,
         "freeze_gate_after_first": freeze_gate_after_first,
+        "suppression_mode": args.suppression_mode,
+        "score_threshold": args.score_threshold,
         "training_hook_applies_suppression": False,
         "eval_hook_applies_suppression": True,
         "pooling_mode": "rich",
