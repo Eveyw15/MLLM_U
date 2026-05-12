@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from gating_module import build_masked_inputs, split_forget_retain
+from gating_module import split_forget_retain
 
 try:
     from gating_module import pool_rich_stats
@@ -54,6 +54,20 @@ def compute_scalar_gate(leak_score: torch.Tensor,
     leak_score=0 maps to alpha_retain.
     """
     return alpha_retain + leak_score * (alpha_forget - alpha_retain)
+
+
+def build_prompt_only_inputs(processor, image, question: str, device: str):
+    """
+    Build prompt-only LLaVA inputs for detector training.
+
+    DGU decides whether to suppress before answer generation, so the detector
+    is trained on the same prompt-only state it will see at inference time.
+    """
+    from minimal_eval_unlok import build_prompt
+
+    prompt = build_prompt(question)
+    inputs = processor(images=image, text=prompt, return_tensors="pt")
+    return inputs.to(device)
 
 
 class LeakDetector(nn.Module):
@@ -103,7 +117,9 @@ class DGUHook:
                  layer: int, channel_indices: list[int],
                  alpha_forget: float = 0.0,
                  alpha_retain: float = 1.0,
-                 capture_values: bool = False):
+                 capture_values: bool = False,
+                 freeze_gate_after_first: bool = True,
+                 apply_suppression: bool = True):
         self.model = model
         self.detector = detector
         self.layer_idx = layer
@@ -111,6 +127,8 @@ class DGUHook:
         self.alpha_forget = alpha_forget
         self.alpha_retain = alpha_retain
         self.capture_values = capture_values
+        self.freeze_gate_after_first = freeze_gate_after_first
+        self.apply_suppression = apply_suppression
 
         self._handle = None
         self.last_detector_logits_train = None
@@ -120,11 +138,18 @@ class DGUHook:
         self.last_scalar_gate = None
         self.leak_score_history = []
         self.scalar_gate_history = []
+        self.frozen_scalar_gate = None
+        self.frozen_leak_score = None
+        self.n_detector_forwards = 0
 
     def reset_train_values(self):
         self.last_detector_logits_train = None
         self.last_leak_score_train = None
         self.last_scalar_gate_train = None
+
+    def reset_frozen_gate(self):
+        self.frozen_scalar_gate = None
+        self.frozen_leak_score = None
 
     def _make_hook(self):
         detector = self.detector
@@ -142,14 +167,26 @@ class DGUHook:
                 is_tuple = False
 
             h_k = h[:, :, ch_idx]
-            features = pool_rich_stats(h_k.detach())
-            logits = detector(features)
-            leak_score = torch.sigmoid(logits)
-            scalar_gate = compute_scalar_gate(
-                leak_score, hook_self.alpha_forget, hook_self.alpha_retain
-            )
+            if (
+                hook_self.freeze_gate_after_first
+                and hook_self.frozen_scalar_gate is not None
+            ):
+                leak_score = hook_self.frozen_leak_score
+                scalar_gate = hook_self.frozen_scalar_gate
+            else:
+                features = pool_rich_stats(h_k.detach())
+                logits = detector(features)
+                hook_self.n_detector_forwards += 1
+                leak_score = torch.sigmoid(logits)
+                scalar_gate = compute_scalar_gate(
+                    leak_score, hook_self.alpha_forget, hook_self.alpha_retain
+                )
 
-            hook_self.last_detector_logits_train = logits
+                hook_self.last_detector_logits_train = logits
+                if hook_self.freeze_gate_after_first:
+                    hook_self.frozen_leak_score = leak_score.detach()
+                    hook_self.frozen_scalar_gate = scalar_gate.detach()
+
             hook_self.last_leak_score_train = leak_score
             hook_self.last_scalar_gate_train = scalar_gate
 
@@ -161,9 +198,12 @@ class DGUHook:
                 hook_self.leak_score_history.append(leak_cpu)
                 hook_self.scalar_gate_history.append(gate_cpu)
 
-            h = h.clone()
-            gate_for_apply = scalar_gate.detach().to(dtype=h_k.dtype).unsqueeze(1)
-            h[:, :, ch_idx] = h_k * gate_for_apply
+            if hook_self.apply_suppression:
+                h = h.clone()
+                gate_for_apply = scalar_gate.detach().to(
+                    device=h_k.device, dtype=h_k.dtype
+                ).unsqueeze(1)
+                h[:, :, ch_idx] = h_k * gate_for_apply
 
             if is_tuple:
                 return (h,) + rest
@@ -176,7 +216,9 @@ class DGUHook:
         self.scalar_gate_history = []
         self.last_leak_score = None
         self.last_scalar_gate = None
+        self.n_detector_forwards = 0
         self.reset_train_values()
+        self.reset_frozen_gate()
 
         from analyze_channels import get_language_layers
         layers = get_language_layers(self.model)
@@ -197,30 +239,43 @@ class DGUHook:
 
 def summarize_dgu_history(leak_score_history: list[torch.Tensor],
                           scalar_gate_history: list[torch.Tensor]) -> dict:
-    """Summarize detector values captured across generation forwards."""
+    """Summarize detector/gate values captured across hook calls."""
     if not leak_score_history or not scalar_gate_history:
         nan = float("nan")
         return {
             "leak_score": nan,
             "scalar_gate": nan,
+            "mean_leak_score": nan,
+            "mean_scalar_gate": nan,
             "first_leak_score": nan,
             "last_leak_score": nan,
             "first_scalar_gate": nan,
             "last_scalar_gate": nan,
+            "n_hook_calls": 0,
             "n_detector_forwards": 0,
         }
 
     leak_stack = torch.stack(leak_score_history, dim=0)
     gate_stack = torch.stack(scalar_gate_history, dim=0)
+    first_leak_score = leak_stack[0].mean().item()
+    last_leak_score = leak_stack[-1].mean().item()
+    mean_leak_score = leak_stack.mean().item()
+    first_scalar_gate = gate_stack[0].mean().item()
+    last_scalar_gate = gate_stack[-1].mean().item()
+    mean_scalar_gate = gate_stack.mean().item()
+    n_hook_calls = len(leak_score_history)
 
     return {
-        "leak_score": leak_stack.mean().item(),
-        "scalar_gate": gate_stack.mean().item(),
-        "first_leak_score": leak_stack[0].mean().item(),
-        "last_leak_score": leak_stack[-1].mean().item(),
-        "first_scalar_gate": gate_stack[0].mean().item(),
-        "last_scalar_gate": gate_stack[-1].mean().item(),
-        "n_detector_forwards": len(leak_score_history),
+        "leak_score": first_leak_score,
+        "scalar_gate": first_scalar_gate,
+        "mean_leak_score": mean_leak_score,
+        "mean_scalar_gate": mean_scalar_gate,
+        "first_leak_score": first_leak_score,
+        "last_leak_score": last_leak_score,
+        "first_scalar_gate": first_scalar_gate,
+        "last_scalar_gate": last_scalar_gate,
+        "n_hook_calls": n_hook_calls,
+        "n_detector_forwards": n_hook_calls,
     }
 
 
@@ -236,7 +291,8 @@ class DGUTrainer:
                  lambda_sep: float = 1.0,
                  score_margin: float = 0.3,
                  alpha_forget: float = 0.0,
-                 alpha_retain: float = 1.0):
+                 alpha_retain: float = 1.0,
+                 freeze_gate_after_first: bool = True):
         self.model = model
         self.processor = processor
         self.detector = detector
@@ -247,39 +303,37 @@ class DGUTrainer:
         self.score_margin = score_margin
         self.alpha_forget = alpha_forget
         self.alpha_retain = alpha_retain
+        self.freeze_gate_after_first = freeze_gate_after_first
 
         for p in model.parameters():
             p.requires_grad = False
 
         self.optimizer = torch.optim.Adam(detector.parameters(), lr=lr)
         self.criterion = nn.BCEWithLogitsLoss()
+        # Training only needs detector logits. It should not alter the frozen
+        # LLaVA hidden states, because the training loss is computed directly
+        # from the captured detector logits rather than from model outputs.
         self.hook = DGUHook(
             model, detector, layer, channel_indices,
             alpha_forget=alpha_forget,
             alpha_retain=alpha_retain,
+            freeze_gate_after_first=False,
+            apply_suppression=False,
         )
 
-    def build_training_inputs(self, sample: dict, label: int):
-        """Build prompt plus answer inputs for detector training."""
+    def build_training_inputs(self, sample: dict):
+        """Build prompt-only inputs for detector training."""
         from PIL import Image
-        from minimal_eval_unlok import build_prompt
 
         image = Image.open(sample["image_path"]).convert("RGB")
-        prompt = build_prompt(sample["question"])
-        if label == 1:
-            answer = sample["target"]
-        else:
-            answer = sample.get("teacher_answer", "").strip() or sample["target"]
+        return build_prompt_only_inputs(
+            self.processor, image, sample["question"], self.device
+        )
 
-        inputs = build_masked_inputs(self.processor, image, prompt, answer, self.device)
-        if "labels" in inputs:
-            del inputs["labels"]
-        return inputs
-
-    def run_detector_forward(self, sample: dict, label: int) -> torch.Tensor:
+    def run_detector_forward(self, sample: dict) -> torch.Tensor:
         """Run one sample through the frozen model and return detector logits."""
         self.hook.reset_train_values()
-        inputs = self.build_training_inputs(sample, label)
+        inputs = self.build_training_inputs(sample)
         outputs = self.model(**inputs)
         del outputs
 
@@ -318,8 +372,8 @@ class DGUTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
 
                 try:
-                    forget_logits = self.run_detector_forward(forget_sample, label=1)
-                    retain_logits = self.run_detector_forward(retain_sample, label=0)
+                    forget_logits = self.run_detector_forward(forget_sample)
+                    retain_logits = self.run_detector_forward(retain_sample)
 
                     forget_labels = torch.ones_like(forget_logits)
                     retain_labels = torch.zeros_like(retain_logits)
@@ -437,6 +491,8 @@ class DGUTrainer:
                     alpha_forget=self.alpha_forget,
                     alpha_retain=self.alpha_retain,
                     capture_values=True,
+                    freeze_gate_after_first=self.freeze_gate_after_first,
+                    apply_suppression=True,
                 )
                 with diag_hook:
                     raw_gated = run_with_image(
@@ -460,6 +516,7 @@ class DGUTrainer:
                 if not gate_history and diag_hook.last_scalar_gate is not None:
                     gate_history = [diag_hook.last_scalar_gate]
                 dgu_summary = summarize_dgu_history(leak_history, gate_history)
+                dgu_summary["n_detector_forwards"] = diag_hook.n_detector_forwards
 
                 results[split_name].append({
                     "id": sample["id"],
@@ -469,6 +526,8 @@ class DGUTrainer:
                     "flip_type": flip_type,
                     "leak_score": dgu_summary["leak_score"],
                     "scalar_gate": dgu_summary["scalar_gate"],
+                    "mean_leak_score": dgu_summary["mean_leak_score"],
+                    "mean_scalar_gate": dgu_summary["mean_scalar_gate"],
                     "ungated_answer": ungated_answer,
                     "gated_answer": gated_answer,
                     **dgu_summary,
@@ -520,6 +579,9 @@ class DGUTrainer:
             "layer": self.layer,
             "alpha_forget": self.alpha_forget,
             "alpha_retain": self.alpha_retain,
+            "freeze_gate_after_first": self.freeze_gate_after_first,
+            "training_hook_applies_suppression": False,
+            "eval_hook_applies_suppression": True,
             "splits": {},
         }
 
@@ -542,10 +604,13 @@ class DGUTrainer:
                         "id": r["id"],
                         "leak_score": round(r["leak_score"], 4),
                         "scalar_gate": round(r["scalar_gate"], 4),
+                        "mean_leak_score": round(r["mean_leak_score"], 4),
+                        "mean_scalar_gate": round(r["mean_scalar_gate"], 4),
                         "first_leak_score": round(r["first_leak_score"], 4),
                         "last_leak_score": round(r["last_leak_score"], 4),
                         "first_scalar_gate": round(r["first_scalar_gate"], 4),
                         "last_scalar_gate": round(r["last_scalar_gate"], 4),
+                        "n_hook_calls": r["n_hook_calls"],
                         "n_detector_forwards": r["n_detector_forwards"],
                         "flip_type": r["flip_type"],
                         "ungated_answer": r["ungated_answer"],
@@ -582,6 +647,10 @@ class DGUTrainer:
             "alpha_retain": self.alpha_retain,
             "lambda_sep": self.lambda_sep,
             "score_margin": self.score_margin,
+            "freeze_gate_after_first": self.freeze_gate_after_first,
+            "training_hook_applies_suppression": False,
+            "eval_hook_applies_suppression": True,
+            "training_mode": "prompt_only",
         }, output_dir / "detector_weights.pt")
         print(f"Detector saved to: {output_dir / 'detector_weights.pt'}")
 
@@ -685,6 +754,8 @@ def parse_args():
                    help="Desired forget minus retain leak-score margin")
     p.add_argument("--alpha_forget", type=float, default=0.0)
     p.add_argument("--alpha_retain", type=float, default=1.0)
+    p.add_argument("--no_freeze_gate_after_first", action="store_true",
+                   help="Recompute DGU gate on every generation forward")
     p.add_argument("--no_quantize", action="store_true",
                    help="Disable 8-bit quantization")
     p.add_argument("--smoke_test", action="store_true",
@@ -767,6 +838,8 @@ def main():
     print(f"Detector created: input_dim={detector.input_dim}, "
           f"hidden_dim={detector.hidden_dim}, {n_params} trainable parameters")
     print(f"Alpha rule: forget={args.alpha_forget}, retain={args.alpha_retain}")
+    freeze_gate_after_first = not args.no_freeze_gate_after_first
+    print(f"Freeze gate after first generation forward: {freeze_gate_after_first}")
 
     trainer = DGUTrainer(
         model, processor, detector,
@@ -778,6 +851,7 @@ def main():
         score_margin=args.score_margin,
         alpha_forget=args.alpha_forget,
         alpha_retain=args.alpha_retain,
+        freeze_gate_after_first=freeze_gate_after_first,
     )
 
     log = []
@@ -819,7 +893,11 @@ def main():
         "score_margin": args.score_margin,
         "alpha_forget": args.alpha_forget,
         "alpha_retain": args.alpha_retain,
+        "freeze_gate_after_first": freeze_gate_after_first,
+        "training_hook_applies_suppression": False,
+        "eval_hook_applies_suppression": True,
         "pooling_mode": "rich",
+        "training_mode": "prompt_only",
     }
     with open(output_dir / "dgu_diagnostics.json", "w") as f:
         json.dump(diagnostics, f, indent=2)
